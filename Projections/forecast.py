@@ -1,24 +1,24 @@
 # forecast.py
-# Script principal que usa classes em projections.py e gera 3 PNGs (1h/1w/1m)
-# Agora lê os parâmetros de horizonte a partir de horizons.json.
+# Script principal que usa classes em projections.py, gera 3 PNGs e faz persistência de modelos.
+# Editar as variáveis no topo: MODEL, INPUT_CSV, CONFIG_FILE, HORIZONS_FILE, MODEL_STORE_FILE.
 #
-# Uso: coloque projections.py, config.json e horizons.json no mesmo diretório;
-# abra no Spyder e execute. Troque MODEL no topo para 'prophet'|'arima'|'holt'.
-#
-# Requisitos: pandas, matplotlib, prophet (se usar prophet), statsmodels (se usar arima/holt).
+# A operação get_or_train_projection carrega o modelo salvo se existir; caso contrário, treina e salva.
 
 import json
+import os
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+from datetime import datetime
 
 from projections import ProphetProjection, ARIMAProjection, HoltProjection
 
 # ----- CONFIGURAÇÕES -----
 MODEL = 'prophet'   # 'prophet', 'arima' ou 'holt'
-INPUT_CSV = './dados/ME02__Medidor_Energy_P9-QDFI_VARIABLE_ENERGY_DEMAND_202510011009.csv'
+INPUT_CSV = './dados/MEDIDOR_202510011009.csv'
 CONFIG_FILE = 'config.json'
 HORIZONS_FILE = 'horizons.json'
+MODEL_STORE_FILE = 'model_store.json'
 # -------------------------
 
 # Carregar config do modelo
@@ -26,9 +26,16 @@ with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
     cfg = json.load(f)
 model_cfg = cfg.get(MODEL, {})
 
-# Carregar horizontes
+# Carregar horizons
 with open(HORIZONS_FILE, 'r', encoding='utf-8') as f:
     horizons_cfg = json.load(f)
+
+# Carregar model store
+with open(MODEL_STORE_FILE, 'r', encoding='utf-8') as f:
+    store_cfg = json.load(f)
+
+MODEL_DIR = store_cfg.get('global', {}).get('model_dir', './models')
+
 
 # Carrega CSV (apenas Date e Value)
 df = pd.read_csv(INPUT_CSV, parse_dates=['Date'])
@@ -36,13 +43,14 @@ df = df[['Date', 'Value']].rename(columns={'Date': 'ds', 'Value': 'y'})
 df = df.sort_values('ds')
 df['y'] = pd.to_numeric(df['y'], errors='coerce')
 
+
 # Função de plot (mesma estética aprovada)
 def plot_standard(df_obs, forecast, horizon_label, model_name, out_png):
     last_date = df_obs['ds'].max()
     is_future = forecast['ds'] > last_date
     is_past = ~is_future
 
-    plt.figure(figsize=(11,6))
+    plt.figure(figsize=(11, 6))
 
     if is_past.any():
         plt.fill_between(np.asarray(forecast.loc[is_past, 'ds'].dt.to_pydatetime()),
@@ -73,22 +81,76 @@ def plot_standard(df_obs, forecast, horizon_label, model_name, out_png):
     plt.show()
 
 
-# Instanciar a projeção escolhida (carrega parâmetros do config.json)
+def get_or_train_projection(model_name, proj_class, model_cfg, store_cfg, df_full):
+    """
+    - model_name: 'prophet'|'arima'|'holt'
+    - proj_class: classe de Projection (ProphetProjection, ARIMAProjection, ...)
+    - model_cfg: dict do config.json para esse modelo
+    - store_cfg: conteúdo de model_store.json
+    - df_full: DataFrame completo com ds,y
+    Retorna instância treinada (carregada do disco ou treinada e salva).
+    """
+    model_entry = store_cfg.get('models', {}).get(model_name, {})
+    save_flag = model_entry.get('save', True)
+    filename = model_entry.get('filename', f"{model_name}_model.pkl")
+    model_dir = store_cfg.get('global', {}).get('model_dir', './models')
+    os.makedirs(model_dir, exist_ok=True)
+    path = os.path.join(model_dir, filename)
+
+    # Tentar carregar
+    if os.path.exists(path):
+        try:
+            print(f"Tentando carregar modelo salvo: {path}")
+            loaded = proj_class.load(path)
+            print("Modelo carregado com sucesso.")
+            return loaded
+        except Exception as e:
+            print(f"Falha ao carregar modelo salvo ({e}), iremos treinar novo modelo.")
+
+    # Se não carregou, instanciar e treinar (treino executado dentro de forecast chamando com periods=0)
+    print("Instanciando e treinando modelo...")
+    train_mode = model_cfg.get('train_mode', 'all')
+    train_fraction = model_cfg.get('train_fraction', 0.8)
+    train_end = model_cfg.get('train_end', None)
+
+    proj = proj_class(params=model_cfg.get('params', {}), train_mode=train_mode,
+                      train_fraction=train_fraction, train_end=train_end)
+
+    # escolher granularidade de treinamento: prefer default_data_window.read_granularity
+    default_gr = store_cfg.get('default_data_window', {}).get('read_granularity', '1min')
+    # chamar forecast com periods=0 para forçar treino (sem prever futuros)
+    try:
+        proj.forecast(df_full, periods=0, freq=default_gr)
+    except Exception as e:
+        print(f"Erro durante o treino inicial com granularidade {default_gr}: {e}")
+        # fallback: usar 'D'
+        proj.forecast(df_full, periods=0, freq='D')
+
+    # salvar se configurado
+    if save_flag:
+        try:
+            proj.save(path)
+            print(f"Modelo salvo em: {path}")
+        except Exception as e:
+            print(f"Falha ao salvar modelo: {e}")
+
+    return proj
+
+
+# Instanciar/obter projeção treinada
 train_mode = model_cfg.get('train_mode', 'all')
 train_fraction = model_cfg.get('train_fraction', 0.8)
 train_end = model_cfg.get('train_end', None)
 
 if MODEL == 'prophet':
-    proj = ProphetProjection(params=model_cfg.get('params', {}), train_mode=train_mode,
-                             train_fraction=train_fraction, train_end=train_end)
+    proj = get_or_train_projection('prophet', ProphetProjection, model_cfg, store_cfg, df)
 elif MODEL == 'arima':
-    proj = ARIMAProjection(params=model_cfg.get('params', {}), train_mode=train_mode,
-                           train_fraction=train_fraction, train_end=train_end)
+    proj = get_or_train_projection('arima', ARIMAProjection, model_cfg, store_cfg, df)
 elif MODEL == 'holt':
-    proj = HoltProjection(params=model_cfg.get('params', {}), train_mode=train_mode,
-                          train_fraction=train_fraction, train_end=train_end)
+    proj = get_or_train_projection('holt', HoltProjection, model_cfg, store_cfg, df)
 else:
     raise ValueError("MODELO inválido. Use 'prophet', 'arima' ou 'holt'.")
+
 
 # Loop pelos horizontes definidos no horizons.json
 for key, params in horizons_cfg.items():
@@ -104,10 +166,10 @@ for key, params in horizons_cfg.items():
 
     out_png = f"forecast_{MODEL}_{key}.png"
 
-    # gerar forecast via classe
+    # gerar forecast via classe (proj já treinada)
     forecast_df = proj.forecast(df, periods=periods, freq=freq)
 
-    # preparar df para plot: prophet usa timestamps originais; outros reamostram
+    # Para plot: prophet usa timestamps originais; outros reamostram
     if MODEL == 'prophet':
         df_obs_for_plot = df.copy()
     else:
@@ -122,7 +184,6 @@ for key, params in horizons_cfg.items():
     # plot
     plot_standard(df_obs_for_plot, forecast_df, key, MODEL, out_png)
 
-    # imprimir última parte do forecast
     tail_n = periods + 3 if periods is not None else 5
     print(f"\nAmostra do forecast ({MODEL}, {key}) — últimas linhas:")
-    print(forecast_df[['ds','yhat','yhat_lower','yhat_upper']].tail(tail_n).to_string(index=False))
+    print(forecast_df[['ds', 'yhat', 'yhat_lower', 'yhat_upper']].tail(tail_n).to_string(index=False))

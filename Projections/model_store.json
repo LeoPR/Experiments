@@ -1,14 +1,28 @@
 {
-  "1h": {
-    "prophet": { "periods": 60, "freq": "min" },
-    "other":   { "periods": 1,  "freq": "h" }
+  "global": {
+    "model_dir": "./models",
+    "auto_retrain_days": 7,
+    "retain_last_n": 3
   },
-  "1w": {
-    "prophet": { "periods": 7, "freq": "d" },
-    "other":   { "periods": 7, "freq": "d" }
+  "default_data_window": {
+    "window_length": "30d",
+    "read_granularity": "1min"
   },
-  "1m": {
-    "prophet": { "periods": 4, "freq": "w" },
-    "other":   { "periods": 4, "freq": "w" }
+  "models": {
+    "prophet": {
+      "save": true,
+      "filename": "prophet_model.pkl",
+      "train_on_startup": true
+    },
+    "arima": {
+      "save": true,
+      "filename": "arima_model.pkl",
+      "train_on_startup": false
+    },
+    "holt": {
+      "save": true,
+      "filename": "holt_model.pkl",
+      "train_on_startup": false
+    }
   }
 }
