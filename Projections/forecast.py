@@ -16,7 +16,7 @@ from projections import ProphetProjection, ARIMAProjection, HoltProjection
 
 # ----- CONFIGURAÇÕES -----
 MODEL = 'prophet'   # 'prophet', 'arima' ou 'holt'
-INPUT_CSV = './dados/Medidor_202510011009.csv'
+INPUT_CSV = './dados/Medidor_Energy_202510011009.csv'
 CONFIG_FILE = 'config.json'
 HORIZONS_FILE = 'horizons.json'
 MODEL_STORE_FILE = 'model_store.json'
