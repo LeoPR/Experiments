@@ -1,0 +1,14 @@
+{
+  "1h": {
+    "prophet": { "periods": 60, "freq": "min" },
+    "other":   { "periods": 1,  "freq": "h" }
+  },
+  "1w": {
+    "prophet": { "periods": 7, "freq": "d" },
+    "other":   { "periods": 7, "freq": "d" }
+  },
+  "1m": {
+    "prophet": { "periods": 4, "freq": "w" },
+    "other":   { "periods": 4, "freq": "w" }
+  }
+}

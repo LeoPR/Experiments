@@ -1,0 +1,36 @@
+{
+  "prophet": {
+    "train_mode": "all",
+    "train_fraction": 0.8,
+    "train_end": null,
+    "params": {
+      "changepoint_prior_scale": 0.01,
+      "seasonality_mode": "additive",
+      "yearly_seasonality": true,
+      "weekly_seasonality": true,
+      "daily_seasonality": true,
+      "interval_width": 0.95
+    }
+  },
+  "arima": {
+    "train_mode": "all",
+    "train_fraction": 0.8,
+    "train_end": null,
+    "params": {
+      "p_max": 2,
+      "d_max": 1,
+      "q_max": 2,
+      "fallback": [1, 0, 1]
+    }
+  },
+  "holt": {
+    "train_mode": "all",
+    "train_fraction": 0.8,
+    "train_end": null,
+    "params": {
+      "trend": "add",
+      "seasonal": null,
+      "initialization_method": "estimated"
+    }
+  }
+}
