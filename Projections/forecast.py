@@ -1,8 +1,9 @@
 # forecast.py
 # Script principal que usa classes em projections.py, gera 3 PNGs e faz persistência de modelos.
-# Editar as variáveis no topo: MODEL, INPUT_CSV, CONFIG_FILE, HORIZONS_FILE, MODEL_STORE_FILE.
+# Agora salva imagens em pasta configurável e respeita o flag save_images no model_store.json.
 #
-# A operação get_or_train_projection carrega o modelo salvo se existir; caso contrário, treina e salva.
+# Uso: coloque projections.py, config.json, horizons.json e model_store.json no mesmo diretório;
+# ajuste INPUT_CSV e MODEL conforme necessário; rode no Spyder.
 
 import json
 import os
@@ -15,7 +16,7 @@ from projections import ProphetProjection, ARIMAProjection, HoltProjection
 
 # ----- CONFIGURAÇÕES -----
 MODEL = 'prophet'   # 'prophet', 'arima' ou 'holt'
-INPUT_CSV = './dados/MEDIDOR_202510011009.csv'
+INPUT_CSV = './dados/Medidor_202510011009.csv'
 CONFIG_FILE = 'config.json'
 HORIZONS_FILE = 'horizons.json'
 MODEL_STORE_FILE = 'model_store.json'
@@ -35,7 +36,11 @@ with open(MODEL_STORE_FILE, 'r', encoding='utf-8') as f:
     store_cfg = json.load(f)
 
 MODEL_DIR = store_cfg.get('global', {}).get('model_dir', './models')
-
+SAVE_IMAGES_FLAG = store_cfg.get('global', {}).get('save_images', True)
+IMAGES_DIR = store_cfg.get('global', {}).get('images_dir', './images')
+os.makedirs(MODEL_DIR, exist_ok=True)
+if SAVE_IMAGES_FLAG:
+    os.makedirs(IMAGES_DIR, exist_ok=True)
 
 # Carrega CSV (apenas Date e Value)
 df = pd.read_csv(INPUT_CSV, parse_dates=['Date'])
@@ -45,7 +50,7 @@ df['y'] = pd.to_numeric(df['y'], errors='coerce')
 
 
 # Função de plot (mesma estética aprovada)
-def plot_standard(df_obs, forecast, horizon_label, model_name, out_png):
+def plot_standard(df_obs, forecast, horizon_label, model_name, out_png, save_images=True, images_dir="./images", show_plot=True):
     last_date = df_obs['ds'].max()
     is_future = forecast['ds'] > last_date
     is_past = ~is_future
@@ -76,9 +81,19 @@ def plot_standard(df_obs, forecast, horizon_label, model_name, out_png):
     plt.legend()
     plt.grid(True)
     plt.tight_layout()
-    plt.savefig(out_png)
-    print(f"Salvo: {out_png}")
-    plt.show()
+
+    if save_images:
+        out_path = os.path.join(images_dir, out_png)
+        try:
+            plt.savefig(out_path)
+            print(f"Salvo: {out_path}")
+        except Exception as e:
+            print(f"Aviso: falha ao salvar imagem {out_path}: {e}")
+
+    if show_plot:
+        plt.show()
+    else:
+        plt.close()
 
 
 def get_or_train_projection(model_name, proj_class, model_cfg, store_cfg, df_full):
@@ -130,6 +145,15 @@ def get_or_train_projection(model_name, proj_class, model_cfg, store_cfg, df_ful
     if save_flag:
         try:
             proj.save(path)
+            # grava também um arquivo meta com versão do model_store (se disponível)
+            meta_store = {
+                "model_name": model_name,
+                "saved_at": datetime.utcnow().isoformat() + "Z",
+                "model_store_version": store_cfg.get('models', {}).get(model_name, {}).get('version')
+            }
+            meta_path = path + ".store.meta.json"
+            with open(meta_path, "w", encoding="utf-8") as fm:
+                json.dump(meta_store, fm, indent=2, ensure_ascii=False)
             print(f"Modelo salvo em: {path}")
         except Exception as e:
             print(f"Falha ao salvar modelo: {e}")
@@ -181,8 +205,10 @@ for key, params in horizons_cfg.items():
     # garantir colunas e ordenação
     forecast_df = forecast_df[['ds', 'yhat', 'yhat_lower', 'yhat_upper']].sort_values('ds').reset_index(drop=True)
 
-    # plot
-    plot_standard(df_obs_for_plot, forecast_df, key, MODEL, out_png)
+    # plot: usa o diretório de imagens configurado no model_store.json
+    image_out_name = out_png
+    plot_standard(df_obs_for_plot, forecast_df, key, MODEL, image_out_name,
+                  save_images=SAVE_IMAGES_FLAG, images_dir=IMAGES_DIR, show_plot=True)
 
     tail_n = periods + 3 if periods is not None else 5
     print(f"\nAmostra do forecast ({MODEL}, {key}) — últimas linhas:")

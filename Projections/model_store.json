@@ -2,7 +2,9 @@
   "global": {
     "model_dir": "./models",
     "auto_retrain_days": 7,
-    "retain_last_n": 3
+    "retain_last_n": 3,
+    "save_images": true,
+    "images_dir": "./images"
   },
   "default_data_window": {
     "window_length": "30d",
@@ -12,17 +14,20 @@
     "prophet": {
       "save": true,
       "filename": "prophet_model.pkl",
-      "train_on_startup": true
+      "train_on_startup": true,
+      "version": "v1"
     },
     "arima": {
       "save": true,
       "filename": "arima_model.pkl",
-      "train_on_startup": false
+      "train_on_startup": false,
+      "version": "v1"
     },
     "holt": {
       "save": true,
       "filename": "holt_model.pkl",
-      "train_on_startup": false
+      "train_on_startup": false,
+      "version": "v1"
     }
   }
 }

@@ -1,13 +1,30 @@
 # projections.py
 # Classes de projeção: Projection (base), ProphetProjection, ARIMAProjection, HoltProjection
-# Agora com métodos save(path) e load(path) usando joblib para persistência simples.
+# Adicionado: save(path) grava o objeto via joblib e escreve um arquivo meta JSON ao lado.
+# Observação: salvar/recuperar Prophet via pickle/joblib pode funcionar, mas dependendo da
+# versão do Prophet / backend pode haver incompatibilidade. Ver o link de changepoints:
+# https://facebook.github.io/prophet/docs/trend_changepoints.html#automatic-changepoint-detection-in-prophet
 
 from abc import ABC, abstractmethod
 import pandas as pd
 import numpy as np
 import joblib
 import os
+import json
+from datetime import datetime
 
+# tentativa de obter versões de pacotes instalados
+def _get_package_version(pkg_name):
+    try:
+        # Python 3.8+
+        from importlib.metadata import version
+        return version(pkg_name)
+    except Exception:
+        try:
+            import pkg_resources
+            return pkg_resources.get_distribution(pkg_name).version
+        except Exception:
+            return "unknown"
 
 class Projection(ABC):
     def __init__(self, params=None, train_mode='all', train_fraction=0.8, train_end=None):
@@ -48,13 +65,41 @@ class Projection(ABC):
     # Persistência mínima usando joblib
     def save(self, path):
         """
-        Salva o objeto Projection (incluindo o artefato treinado) em path via joblib.
+        Salva o objeto Projection (incluindo o artefato treinado) em path via joblib,
+        e escreve um arquivo meta JSON com informações básicas de versão.
         path: caminho para arquivo .pkl
         """
         directory = os.path.dirname(path)
         if directory and not os.path.exists(directory):
             os.makedirs(directory, exist_ok=True)
+
+        # salva o objeto
         joblib.dump(self, path)
+
+        # meta info
+        meta = {
+            "saved_at": datetime.utcnow().isoformat() + "Z",
+            "params": self.params,
+            "train_mode": self.train_mode,
+            "train_fraction": self.train_fraction,
+            "train_end": str(self.train_end) if self.train_end is not None else None,
+            "python_version": "{}".format(os.sys.version.split()[0]),
+            "package_versions": {
+                "pandas": _get_package_version("pandas"),
+                "numpy": _get_package_version("numpy"),
+                "joblib": _get_package_version("joblib"),
+                "statsmodels": _get_package_version("statsmodels"),
+                "prophet": _get_package_version("prophet")
+            }
+        }
+
+        meta_path = path + ".meta.json"
+        try:
+            with open(meta_path, "w", encoding="utf-8") as f:
+                json.dump(meta, f, indent=2, ensure_ascii=False)
+        except Exception as e:
+            # não quebrar o fluxo se falhar ao gravar meta
+            print(f"Aviso: falha ao gravar meta ({meta_path}): {e}")
 
     @classmethod
     def load(cls, path):
@@ -82,7 +127,7 @@ class ProphetProjection(Projection):
 
         # Treina usando train_df
         m.fit(train_df)
-        # Guardar artefato interno para possível debug (não usado diretamente)
+        # Guardar artefato interno (pode ser serializado pelo joblib, dependendo do ambiente)
         self._fitted = m
 
         # future para o período pedido (a partir do fim do treino)
