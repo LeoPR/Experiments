@@ -1,8 +1,5 @@
 {
   "prophet": {
-    "train_mode": "all",
-    "train_fraction": 0.8,
-    "train_end": null,
     "params": {
       "changepoint_prior_scale": 0.01,
       "seasonality_mode": "additive",
@@ -12,25 +9,77 @@
       "interval_width": 0.95
     }
   },
-  "arima": {
-    "train_mode": "all",
-    "train_fraction": 0.8,
-    "train_end": null,
-    "params": {
-      "p_max": 2,
-      "d_max": 1,
-      "q_max": 2,
-      "fallback": [1, 0, 1]
+  "models_defaults": {
+    "model_dir": "./models",
+    "model_version": "v1",
+    "images_dir": "./images"
+  },
+  "extractor": {
+    "connection": {
+      "server": "10.60.101.232",
+      "database": "zilia_navitas",
+      "driver": "SQL Server",
+      "port": 1433,
+      "credentials_file": "credenciais.json",
+      "env_user_var": "EXTRACTOR_DB_USER",
+      "env_pass_var": "EXTRACTOR_DB_PASS"
+    },
+    "query": {
+      "template_lines": [
+        "SELECT",
+        "  e.EquipmentName,",
+        "  v.Name AS VariableName,",
+        "  vv.Value,",
+        "  vv.[Date]",
+        "FROM Equipment e",
+        "JOIN VariableEquipment ve ON ve.EquipmentId = e.Id AND ve.IsEnabled = 1",
+        "JOIN Variable v ON v.Id = ve.VariableId",
+        "JOIN VariableValue vv ON vv.VariableEquipmentId = ve.Id",
+        "WHERE e.Code = ?",
+        "  AND v.Id = ?",
+        "  AND vv.[Date] >= ?",
+        "ORDER BY 4 DESC"
+      ],
+      "params": {
+        "equipment_code": "ME02",
+        "variable_id": "6df49571-09fd-40bd-8cc3-6ed5564bba36",
+        "date_from": "2025-09-28"
+      },
+      "param_order": [
+        "equipment_code",
+        "variable_id",
+        "date_from"
+      ]
+    },
+    "output": {
+      "output_dir": "./dados",
+      "output_basename": "product_extraction",
+      "always_gzip": true
+    },
+    "transfer": {
+      "batch_size": 1000,
+      "agg_bucket": "15min",
+      "round_decimals": 6,
+      "date_trunc": "second"
+    },
+    "train": {
+      "y_column": "Value",
+      "ds_column": "Date",
+      "extra_columns": ["EquipmentName"],
+      "train_per_equipment": true,
+      "equipment_filter": null
     }
   },
-  "holt": {
-    "train_mode": "all",
-    "train_fraction": 0.8,
-    "train_end": null,
-    "params": {
-      "trend": "add",
-      "seasonal": null,
-      "initialization_method": "estimated"
+  "infer": {
+    "default_models": {
+      "general_name": "general_prophet.pkl",
+      "specific_template": "{slug}_prophet.pkl"
+    },
+    "forecast_output_dir": "./dados/forecasts",
+    "examples": {
+      "hour": { "horizon": "1H", "resolution": "15min" },
+      "week": { "horizon": "7D", "resolution": "H" },
+      "month": { "horizon": "30D", "resolution": "D" }
     }
   }
 }
