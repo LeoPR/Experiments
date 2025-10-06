@@ -5,10 +5,13 @@ infer.py - Inferência minimalista usando modelos Prophet treinados.
 - Lê config.json para localizar models_dir e o arquivo extraído (CSV.gz).
 - Carrega o modelo específico do equipamento se existir, senão usa o modelo "general".
 - Gera previsões para horizon/resolution passados como parâmetros.
-- Salva CSV comprimido do forecast e um PNG do gráfico (opcional).
+- Salva CSV comprimido do forecast (futuro + histórico exibido) e um PNG do gráfico (opcional).
+- Agora limita a janela de histórico exibida conforme o horizonte (exibição mais “zoomed”):
+    * <=1H  -> últimas 24H de histórico
+    * <=7D  -> últimas 4 semanas (28D)
+    * <=30D -> últimas 16 semanas (~112D)
 
-Uso básico:
-  Ajuste parâmetros em __main__ ou importe infer(...) de outro script.
+Uso:
   pip install pandas prophet joblib matplotlib
   python infer.py
 """
@@ -36,7 +39,6 @@ FORECAST_DIR = INFER_CFG.get("forecast_output_dir", "./dados/forecasts")
 GENERAL_MODEL_NAME = INFER_CFG.get("default_models", {}).get("general_name", "general_prophet.pkl")
 SPECIFIC_TEMPLATE = INFER_CFG.get("default_models", {}).get("specific_template", "{slug}_prophet.pkl")
 
-# util simples
 def slugify(s):
     s = str(s or "")
     out = []
@@ -49,7 +51,6 @@ def slugify(s):
             out.append("_")
     return "".join(out) or "model"
 
-# localizar modelo (específico -> geral)
 def find_model(equipment_name):
     specific = os.path.join(MODELS_DIR, SPECIFIC_TEMPLATE.format(slug=slugify(equipment_name)))
     general = os.path.join(MODELS_DIR, GENERAL_MODEL_NAME)
@@ -59,135 +60,166 @@ def find_model(equipment_name):
         return general
     raise FileNotFoundError(f"Nenhum modelo encontrado: tentei '{specific}' e '{general}'")
 
-# ler last_ds do meta do modelo, se existir
 def model_last_ds(meta_path):
     if os.path.exists(meta_path):
-        with open(meta_path, "r", encoding="utf-8") as fm:
-            mm = json.load(fm)
-        if mm.get("last_ds"):
-            return pd.to_datetime(mm.get("last_ds"))
+        try:
+            with open(meta_path, "r", encoding="utf-8") as fm:
+                mm = json.load(fm)
+            if mm.get("last_ds"):
+                return pd.to_datetime(mm.get("last_ds"))
+        except Exception:
+            pass
     return None
 
-# calcular periods a partir de horizon/resolution
 def compute_periods(horizon, resolution):
     th = pd.Timedelta(horizon)
     off = to_offset(resolution)
-    periods = int(math.ceil(th / off))
-    return periods
+    return int(math.ceil(th / off))
 
-# função principal de inferência
 def infer(equipment_name=None, start=None, horizon="1H", resolution="15min", save_image=True, image_name=None):
     model_path = find_model(equipment_name)
     print(f"[{datetime.utcnow().isoformat()}Z] Carregando modelo: {model_path}")
     model = joblib.load(model_path)
 
-    # tentar obter last_ds do meta do modelo
     meta_path = model_path + ".meta.json"
     last_ds = model_last_ds(meta_path)
 
-    # carregar observados (para plot e pré-predição)
+    # carregar observados
     obs = pd.DataFrame(columns=["ds","y"])
     if os.path.exists(INPUT_PATH):
-        obs = pd.read_csv(INPUT_PATH, compression="gzip", parse_dates=[cfg.get("extractor", {}).get("train", {}).get("ds_column", "Date")])
-        # normalizar nomes: Date -> ds, Value -> y
+        raw = pd.read_csv(
+            INPUT_PATH,
+            compression="gzip",
+            parse_dates=[cfg.get("extractor", {}).get("train", {}).get("ds_column", "Date")]
+        )
         colmap = {}
-        for c in obs.columns:
+        for c in raw.columns:
             lc = c.strip().lower()
             if lc in ("date","ds","timestamp"):
                 colmap[c] = "ds"
             if lc in ("value","valor","val"):
                 colmap[c] = "y"
-        obs = obs.rename(columns=colmap)
-        if "ds" in obs.columns and "y" in obs.columns:
-            obs = obs[["ds","y"]].dropna().sort_values("ds").reset_index(drop=True)
-        else:
-            obs = pd.DataFrame(columns=["ds","y"])
+        raw = raw.rename(columns=colmap)
+        if "ds" in raw.columns and "y" in raw.columns:
+            obs = raw[["ds","y"]].dropna().sort_values("ds").reset_index(drop=True)
 
-    # determinar start
     if start:
         start_ts = pd.to_datetime(start)
     else:
         start_ts = last_ds if last_ds is not None else (obs["ds"].max() if not obs.empty else pd.Timestamp.now())
 
     periods = compute_periods(horizon, resolution)
+    if periods <= 0:
+        raise ValueError("HORIZON/RESOLUTION resultaram em periods <= 0.")
 
-    # predição in-sample (histórico) - tentamos prever exatamente nas ds observadas
+    # histórico (in-sample)
     hist_pred = None
     if not obs.empty:
         try:
-            hist_pred = model.predict(obs[["ds"]].rename(columns={"ds":"ds"}))[["ds","yhat","yhat_lower","yhat_upper"]]
+            hist_pred = model.predict(obs[["ds"]])[["ds","yhat","yhat_lower","yhat_upper"]]
             hist_pred = hist_pred[hist_pred["ds"].isin(obs["ds"])]
         except Exception as e:
             print(f"Aviso: predição in-sample falhou: {e}")
-            hist_pred = None
 
-    # construir futuro iniciando em start + resolution
+    # futuro
     res_off = to_offset(resolution)
-    start_next = pd.to_datetime(start_ts) + res_off
-    future_idx = pd.date_range(start=start_next, periods=periods, freq=resolution)
-    future_df = pd.DataFrame({"ds": future_idx})
-    fut_pred = model.predict(future_df)[["ds","yhat","yhat_lower","yhat_upper"]]
+    future_start = pd.to_datetime(start_ts) + res_off
+    future_idx = pd.date_range(start=future_start, periods=periods, freq=resolution)
+    fut_pred = model.predict(pd.DataFrame({"ds": future_idx}))[["ds","yhat","yhat_lower","yhat_upper"]]
 
-    # concatenar
     if hist_pred is not None:
         forecast_df = pd.concat([hist_pred, fut_pred], ignore_index=True).sort_values("ds").reset_index(drop=True)
     else:
         forecast_df = fut_pred.sort_values("ds").reset_index(drop=True)
 
-    # salvar forecast (gzip)
+    # ---------------- NOVO BLOCO: limitar janela de exibição ----------------
+    # Regras:
+    # <= 1H  -> últimas 24H de histórico
+    # <= 7D  -> últimas 28D
+    # <= 30D -> últimas 112D (16 semanas), ajustável
+    display_window = None
+    try:
+        h_td = pd.Timedelta(horizon)
+        if h_td <= pd.Timedelta("1H"):
+            display_window = pd.Timedelta("24H")
+        elif h_td <= pd.Timedelta("7D"):
+            display_window = pd.Timedelta("28D")
+        elif h_td <= pd.Timedelta("30D"):
+            display_window = pd.Timedelta("112D")
+    except Exception:
+        pass
+
+    if display_window and not obs.empty:
+        cutoff = obs["ds"].max() - display_window
+        # filtrar observados
+        obs = obs[obs["ds"] >= cutoff].copy()
+        # filtrar parte histórica do forecast (qualquer ds < primeiro de obs some)
+        min_obs_ds = obs["ds"].min()
+        forecast_df = forecast_df[forecast_df["ds"] >= min_obs_ds].reset_index(drop=True)
+    # ------------------------------------------------------------------------
+
+    # salvar forecast
     os.makedirs(FORECAST_DIR, exist_ok=True)
     fname = f"{slugify(equipment_name or 'general')}_forecast_{horizon}_{resolution}.csv.gz"
     out_path = os.path.join(FORECAST_DIR, fname)
     forecast_df.to_csv(out_path, index=False, compression="gzip")
     print(f"[{datetime.utcnow().isoformat()}Z] Forecast salvo: {out_path}")
 
-    # plot simples
+    # plot (apenas janela filtrada)
     plt.figure(figsize=(11,6))
-    last_date = obs['ds'].max() if not obs.empty else forecast_df['ds'].min()
-    is_future = forecast_df['ds'] > last_date
+    last_hist_date = obs['ds'].max() if not obs.empty else forecast_df['ds'].min()
+    is_future = forecast_df['ds'] > last_hist_date
     is_past = ~is_future
+
     if is_past.any():
-        plt.fill_between(forecast_df.loc[is_past,'ds'], forecast_df.loc[is_past,'yhat_lower'], forecast_df.loc[is_past,'yhat_upper'], color='lightgray', alpha=0.4)
+        plt.fill_between(forecast_df.loc[is_past,'ds'],
+                         forecast_df.loc[is_past,'yhat_lower'],
+                         forecast_df.loc[is_past,'yhat_upper'],
+                         color='lightgray', alpha=0.4, label='IC (histórico)')
     if is_future.any():
-        plt.fill_between(forecast_df.loc[is_future,'ds'], forecast_df.loc[is_future,'yhat_lower'], forecast_df.loc[is_future,'yhat_upper'], color='salmon', alpha=0.35)
+        plt.fill_between(forecast_df.loc[is_future,'ds'],
+                         forecast_df.loc[is_future,'yhat_lower'],
+                         forecast_df.loc[is_future,'yhat_upper'],
+                         color='salmon', alpha=0.35, label='IC (futuro)')
     if not obs.empty:
         plt.scatter(obs['ds'], obs['y'], color='black', s=18, label='Observado')
     plt.plot(forecast_df['ds'], forecast_df['yhat'], color='lightblue', linewidth=1, label='yhat')
     if is_future.any():
-        plt.plot(forecast_df.loc[is_future,'ds'], forecast_df.loc[is_future,'yhat'], color='red', linewidth=2, label='Futuro')
+        plt.plot(forecast_df.loc[is_future,'ds'], forecast_df.loc[is_future,'yhat'],
+                 color='red', linewidth=2, label='Futuro')
+
     plt.xlabel("Data")
     plt.ylabel("Value")
-    title = f"Forecast - {equipment_name or 'general'} - horizon {horizon} res {resolution}"
-    plt.title(title)
+    plt.title(f"Forecast - {equipment_name or 'general'} - horizon {horizon} res {resolution}")
     plt.legend()
     plt.grid(True)
     plt.tight_layout()
+
     if save_image:
         os.makedirs(IMAGES_DIR, exist_ok=True)
-        img_name = image_name if (image_name := None) else f"forecast_{slugify(equipment_name or 'general')}_{horizon}_{resolution}.png"
+        img_name = image_name or f"forecast_{slugify(equipment_name or 'general')}_{horizon}_{resolution}.png"
         img_path = os.path.join(IMAGES_DIR, img_name)
         plt.savefig(img_path)
         print(f"[{datetime.utcnow().isoformat()}Z] Gráfico salvo: {img_path}")
-    plt.show()
 
+    plt.show()
     return forecast_df
 
-# exemplos de uso mínimo (gera 3 gráficos como no pipeline antigo)
+# exemplos (mantidos)
 if __name__ == "__main__":
     ex = INFER_CFG.get("examples", {})
-    # 1h / 15min
     try:
         e1 = ex.get("hour", {"horizon":"1H","resolution":"15min"})
         infer(equipment_name=None, start=None, horizon=e1["horizon"], resolution=e1["resolution"], save_image=True)
     except Exception as err:
         print("Erro exemplo 1:", err)
-    # 1w / hora
+
     try:
         e2 = ex.get("week", {"horizon":"7D","resolution":"H"})
         infer(equipment_name=None, start=None, horizon=e2["horizon"], resolution=e2["resolution"], save_image=True)
     except Exception as err:
         print("Erro exemplo 2:", err)
-    # 1m / dia
+
     try:
         e3 = ex.get("month", {"horizon":"30D","resolution":"D"})
         infer(equipment_name=None, start=None, horizon=e3["horizon"], resolution=e3["resolution"], save_image=True)

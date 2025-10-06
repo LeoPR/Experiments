@@ -1,7 +1,7 @@
 {
   "prophet": {
     "params": {
-      "changepoint_prior_scale": 0.01,
+      "changepoint_prior_scale": 0.0001,
       "seasonality_mode": "additive",
       "yearly_seasonality": true,
       "weekly_seasonality": true,
@@ -43,7 +43,7 @@
       "params": {
         "equipment_code": "ME02",
         "variable_id": "6df49571-09fd-40bd-8cc3-6ed5564bba36",
-        "date_from": "2025-09-28"
+        "date_from": "2025-09-01"
       },
       "param_order": [
         "equipment_code",
