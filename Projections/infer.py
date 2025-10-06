@@ -6,10 +6,12 @@ infer.py - Inferência minimalista usando modelos Prophet treinados.
 - Carrega o modelo específico do equipamento se existir, senão usa o modelo "general".
 - Gera previsões para horizon/resolution passados como parâmetros.
 - Salva CSV comprimido do forecast (futuro + histórico exibido) e um PNG do gráfico (opcional).
-- Agora limita a janela de histórico exibida conforme o horizonte (exibição mais “zoomed”):
-    * <=1H  -> últimas 24H de histórico
-    * <=7D  -> últimas 4 semanas (28D)
-    * <=30D -> últimas 16 semanas (~112D)
+- A janela exibida é limitada conforme o horizonte:
+    * <=1H  -> últimas 24H (a janela termina no último timestamp projetado)
+    * <=7D  -> últimas 2 semanas (14D)
+    * <=30D -> últimos 3 meses (~90D)
+
+Alteração solicitada: exibir rótulos de hora com sufixo "h" (ex: "14h") quando a janela for curta / quando for sensible mostrar horas.
 
 Uso:
   pip install pandas prophet joblib matplotlib
@@ -21,6 +23,7 @@ from datetime import datetime
 import pandas as pd
 import matplotlib.pyplot as plt
 from pandas.tseries.frequencies import to_offset
+import matplotlib.dates as mdates
 
 # carregar config
 with open("config.json", "r", encoding="utf-8") as f:
@@ -133,29 +136,25 @@ def infer(equipment_name=None, start=None, horizon="1H", resolution="15min", sav
         forecast_df = fut_pred.sort_values("ds").reset_index(drop=True)
 
     # ---------------- NOVO BLOCO: limitar janela de exibição ----------------
-    # Regras:
-    # <= 1H  -> últimas 24H de histórico
-    # <= 7D  -> últimas 28D
-    # <= 30D -> últimas 112D (16 semanas), ajustável
-    display_window = None
+    display_start = None
+    display_end = None
     try:
+        display_end = forecast_df["ds"].max()
         h_td = pd.Timedelta(horizon)
         if h_td <= pd.Timedelta("1H"):
-            display_window = pd.Timedelta("24H")
+            display_start = display_end - pd.Timedelta("24H") + res_off
         elif h_td <= pd.Timedelta("7D"):
-            display_window = pd.Timedelta("28D")
+            display_start = display_end - pd.Timedelta("14D")
         elif h_td <= pd.Timedelta("30D"):
-            display_window = pd.Timedelta("112D")
+            display_start = display_end - pd.Timedelta("90D")
     except Exception:
-        pass
+        display_start = None
+        display_end = None
 
-    if display_window and not obs.empty:
-        cutoff = obs["ds"].max() - display_window
-        # filtrar observados
-        obs = obs[obs["ds"] >= cutoff].copy()
-        # filtrar parte histórica do forecast (qualquer ds < primeiro de obs some)
-        min_obs_ds = obs["ds"].min()
-        forecast_df = forecast_df[forecast_df["ds"] >= min_obs_ds].reset_index(drop=True)
+    if display_start is not None:
+        if not obs.empty:
+            obs = obs[obs["ds"] >= display_start].copy()
+        forecast_df = forecast_df[forecast_df["ds"] >= display_start].reset_index(drop=True)
     # ------------------------------------------------------------------------
 
     # salvar forecast
@@ -167,6 +166,7 @@ def infer(equipment_name=None, start=None, horizon="1H", resolution="15min", sav
 
     # plot (apenas janela filtrada)
     plt.figure(figsize=(11,6))
+    ax = plt.gca()
     last_hist_date = obs['ds'].max() if not obs.empty else forecast_df['ds'].min()
     is_future = forecast_df['ds'] > last_hist_date
     is_past = ~is_future
@@ -188,6 +188,26 @@ def infer(equipment_name=None, start=None, horizon="1H", resolution="15min", sav
         plt.plot(forecast_df.loc[is_future,'ds'], forecast_df.loc[is_future,'yhat'],
                  color='red', linewidth=2, label='Futuro')
 
+    # --- ajuste mínimo para rótulos de hora com sufixo "h" ---
+    # Se a janela exibida for curta (até ~24H) ou se a resolução for horária/minutar,
+    # ajustamos o formatter para mostrar "14h" em vez de "14:00".
+    try:
+        display_span = None
+        if display_start is not None and display_end is not None:
+            display_span = display_end - display_start
+        short_window = (display_span is not None and display_span <= pd.Timedelta("2D"))
+        res_lower = resolution.lower()
+        is_hour_like = ("h" in res_lower and "min" not in res_lower) or ("min" in res_lower) or (res_lower in ("t","min"))
+        if short_window and is_hour_like:
+            # formatador de horas com 'h'
+            ax.xaxis.set_major_formatter(mdates.DateFormatter("%Hh"))
+            # usar locator de horas para ficar legível
+            ax.xaxis.set_major_locator(mdates.AutoDateLocator())
+            plt.gcf().autofmt_xdate()
+    except Exception:
+        pass
+    # -------------------------------------------------------------
+
     plt.xlabel("Data")
     plt.ylabel("Value")
     plt.title(f"Forecast - {equipment_name or 'general'} - horizon {horizon} res {resolution}")
@@ -205,7 +225,7 @@ def infer(equipment_name=None, start=None, horizon="1H", resolution="15min", sav
     plt.show()
     return forecast_df
 
-# exemplos (mantidos)
+# exemplos de uso (mantidos)
 if __name__ == "__main__":
     ex = INFER_CFG.get("examples", {})
     try:

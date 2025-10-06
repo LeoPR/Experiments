@@ -1,12 +1,12 @@
 {
   "prophet": {
     "params": {
-      "changepoint_prior_scale": 0.0001,
+      "changepoint_prior_scale": 0.5,
       "seasonality_mode": "additive",
-      "yearly_seasonality": true,
+      "yearly_seasonality": false,
       "weekly_seasonality": true,
       "daily_seasonality": true,
-      "interval_width": 0.95
+      "interval_width": 0.80
     }
   },
   "models_defaults": {
@@ -35,15 +35,17 @@
         "JOIN VariableEquipment ve ON ve.EquipmentId = e.Id AND ve.IsEnabled = 1",
         "JOIN Variable v ON v.Id = ve.VariableId",
         "JOIN VariableValue vv ON vv.VariableEquipmentId = ve.Id",
-        "WHERE e.Code = ?",
-        "  AND v.Id = ?",
-        "  AND vv.[Date] >= ?",
+        "WHERE e.Code = {equipment_code}",
+        "  AND v.Id = {variable_id}",
+        "  AND vv.[Date] >= {date_from}",
         "ORDER BY 4 DESC"
       ],
       "params": {
         "equipment_code": "ME02",
         "variable_id": "6df49571-09fd-40bd-8cc3-6ed5564bba36",
-        "date_from": "2025-09-01"
+        "date_from": {
+          "raw": "DATEADD(day, -30, CAST(GETDATE() AS date))"
+        }
       },
       "param_order": [
         "equipment_code",
@@ -65,7 +67,9 @@
     "train": {
       "y_column": "Value",
       "ds_column": "Date",
-      "extra_columns": ["EquipmentName"],
+      "extra_columns": [
+        "EquipmentName"
+      ],
       "train_per_equipment": true,
       "equipment_filter": null
     }
@@ -77,9 +81,18 @@
     },
     "forecast_output_dir": "./dados/forecasts",
     "examples": {
-      "hour": { "horizon": "1H", "resolution": "15min" },
-      "week": { "horizon": "7D", "resolution": "H" },
-      "month": { "horizon": "30D", "resolution": "D" }
+      "hour": {
+        "horizon": "1H",
+        "resolution": "15min"
+      },
+      "week": {
+        "horizon": "7D",
+        "resolution": "H"
+      },
+      "month": {
+        "horizon": "30D",
+        "resolution": "D"
+      }
     }
   }
 }

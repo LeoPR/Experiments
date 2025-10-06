@@ -1,18 +1,19 @@
 #!/usr/bin/env python3
 """
-extrator_sql.py - Extrator minimalista em blocos que lê config.json e credenciais externas.
+extrator_sql.py - Extrator minimalista que aceita params literais ou fragmentos SQL (raw).
 
-Mudanças:
-- Removeu user/password do config principal.
-- Lê credenciais de:
-   1) Variáveis de ambiente (EXTRACTOR_DB_USER / EXTRACTOR_DB_PASS) se setadas
-   2) Arquivo credenciais.json (chave extractor_credentials.username/password)
-   3) Erro se não encontrar
+Config esperado:
+ - extractor.query.template_lines contém placeholders nomeados: {equipment_code}, {variable_id}, {date_from}
+ - extractor.query.params tem valores simples ou {"raw": "<SQL_FRAGMENT>"}
+ - extractor.query.param_order define a ordem lógica dos parâmetros (para binding)
+
+Comportamento:
+ - Substitui placeholders por "?" para parâmetros que serão bindados, ou pelo fragmento SQL para params raw.
+ - Executa cur.execute(query, tuple(bind_values))
+ - Grava CSV.gz e um meta JSON ao lado.
 
 Requisitos:
   pip install pyodbc
-Uso:
-  python extrator_sql.py
 """
 
 import json
@@ -31,7 +32,19 @@ def load_json(path):
 def param_values_from_config(qcfg):
     order = qcfg.get("param_order", [])
     params = qcfg.get("params", {})
-    return tuple(params.get(k) for k in order)
+    # retorna (mapping_for_format, bind_values_tuple)
+    fmt_map = {}
+    bind_values = []
+    for name in order:
+        val = params.get(name)
+        if isinstance(val, dict) and "raw" in val:
+            # raw SQL fragment: inject inline (no binding)
+            fmt_map[name] = val["raw"]
+        else:
+            # use binding placeholder and append to bind list
+            fmt_map[name] = "?"
+            bind_values.append(val)
+    return fmt_map, tuple(bind_values)
 
 def format_value_for_csv(v):
     if v is None:
@@ -41,33 +54,21 @@ def format_value_for_csv(v):
     return v
 
 def resolve_credentials(conn_cfg):
-    """
-    Ordem:
-      1. Variáveis de ambiente (env_user_var/env_pass_var)
-      2. Arquivo credenciais.json (credentials_file)
-    """
     env_user_var = conn_cfg.get("env_user_var", "EXTRACTOR_DB_USER")
     env_pass_var = conn_cfg.get("env_pass_var", "EXTRACTOR_DB_PASS")
-
     user_env = os.getenv(env_user_var)
     pass_env = os.getenv(env_pass_var)
-
     if user_env and pass_env:
         return user_env, pass_env
-
     cred_file = conn_cfg.get("credentials_file", "credenciais.json")
     if os.path.exists(cred_file):
-        try:
-            data = load_json(cred_file)
-            creds = data.get("extractor_credentials", {})
-            u = creds.get("username")
-            p = creds.get("password")
-            if u and p:
-                return u, p
-        except Exception as e:
-            raise RuntimeError(f"Falha ao ler {cred_file}: {e}")
-
-    raise RuntimeError("Credenciais não encontradas (nem variáveis de ambiente nem arquivo de credenciais).")
+        data = load_json(cred_file)
+        creds = data.get("extractor_credentials", {})
+        u = creds.get("username")
+        p = creds.get("password")
+        if u and p:
+            return u, p
+    raise RuntimeError("Credenciais não encontradas (variáveis de ambiente ou arquivo).")
 
 def run_extract():
     cfg = load_json(CONFIG_PATH)
@@ -94,26 +95,31 @@ def run_extract():
     query_lines = q_cfg.get("template_lines", [])
     if not query_lines:
         raise ValueError("Config: extractor.query.template_lines vazio.")
-    query = "\n".join(line.rstrip() for line in query_lines)
-    params = param_values_from_config(q_cfg)
+
+    # Monta mapa de formatação e bind_values simples (muito direto)
+    fmt_map, bind_values = param_values_from_config(q_cfg)
+    # junta as linhas com placeholders nomeados
+    query_template = "\n".join(line.rstrip() for line in query_lines)
+    # formata: params raw serão substituídos por seu fragmento SQL; os outros por '?'
+    query = query_template.format(**fmt_map)
 
     os.makedirs(output_dir, exist_ok=True)
 
-    conn_str = (
-        f"DRIVER={{{driver}}};SERVER={server},{port};DATABASE={database};"
-        f"UID={username};PWD={password}"
-    )
+    conn_str = f"DRIVER={{{driver}}};SERVER={server},{port};DATABASE={database};UID={username};PWD={password}"
 
     total_written = 0
     columns_info = []
     sample_python_types = {}
 
     print(f"[{datetime.utcnow().isoformat()}Z] Iniciando extração. Output: {gzip_path}")
-    print(f"Query (primeiras 200 chars):\n{query[:200]}")
+    print(f"Query (preview):\n{query}")
 
     with pyodbc.connect(conn_str, autocommit=True) as conn:
         with conn.cursor() as cur:
-            cur.execute(query, params)
+            if bind_values:
+                cur.execute(query, bind_values)
+            else:
+                cur.execute(query)
             desc = cur.description
             if not desc:
                 with gzip.open(gzip_path, "wt", encoding="utf-8", newline="") as _:
@@ -123,7 +129,7 @@ def run_extract():
                     "rows_written": 0,
                     "columns": [],
                     "query": query,
-                    "params": params
+                    "params": q_cfg.get("params", {})
                 }
                 with open(meta_path, "w", encoding="utf-8") as fm:
                     json.dump(meta, fm, indent=2, ensure_ascii=False)
@@ -165,7 +171,7 @@ def run_extract():
         "columns": columns_info,
         "sample_python_types": sample_python_types,
         "query": query,
-        "params": params,
+        "params": q_cfg.get("params", {}),
         "output_path": gzip_path,
         "server": server,
         "database": database
