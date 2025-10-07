@@ -2,15 +2,11 @@
 """
 train.py - Treina modelos Prophet a partir do CSV extraído pelo extrator.
 
-Mudanças principais:
-- NÃO agrupa mais por 'ds' (o SELECT do banco controla forma/volume).
-- Permite reamostragem (resample) opcional controlada por config (train_resample_enabled, train_resample_freq).
-- train_resample_freq exemplo: "1min". Se ativado, aplica resample+interpolate por série antes do treino.
-- train_max_history_days (opcional) limita janela antes do resample.
-
-Uso:
-  pip install pandas prophet joblib
-  python train.py
+Mudanças (esta versão):
+- Suporte a prophet.extra_seasonalities (config.json) aplicando add_seasonalities antes de fit().
+- Mantida remoção de groupby.
+- Resample opcional permanece.
+- Timestamps timezone-aware (UTC).
 """
 
 import os
@@ -46,6 +42,7 @@ TRAIN_MAX_HISTORY_DAYS = train_cfg.get("train_max_history_days", None)
 
 MODELS_DIR = cfg.get("models_defaults", {}).get("model_dir", "./models")
 PROPHET_PARAMS = cfg.get("prophet", {}).get("params", {})
+EXTRA_SEASONALITIES = cfg.get("prophet", {}).get("extra_seasonalities", [])
 
 def slugify(s):
     s = str(s or "")
@@ -59,12 +56,45 @@ def slugify(s):
             out.append("_")
     return "".join(out) or "model"
 
+def apply_extra_seasonalities(model, extra_list):
+    """
+    Aplica sazonalidades extras definidas no config.
+    Estrutura esperada de cada item:
+      {
+        "name": "...",
+        "period": <float>,
+        "fourier_order": <int>,
+        "prior_scale": <float opcional>,
+        "mode": <'additive'|'multiplicative' opcional>
+      }
+    """
+    applied = []
+    for seas in extra_list:
+        try:
+            kwargs = {
+                "name": seas["name"],
+                "period": seas["period"],
+                "fourier_order": seas["fourier_order"],
+                "prior_scale": seas.get("prior_scale", 10.0)
+            }
+            # mode é opcional; só passar se presente
+            if "mode" in seas and seas["mode"]:
+                kwargs["mode"] = seas["mode"]
+            model.add_seasonality(**kwargs)
+            applied.append(seas)
+        except Exception as e:
+            print(f"Aviso: falha ao adicionar sazonalidade {seas.get('name')}: {e}")
+    return applied
+
 def train_and_save(df, label, meta_extra=None):
     os.makedirs(MODELS_DIR, exist_ok=True)
     slug = slugify(label)
     pkl = os.path.join(MODELS_DIR, f"{slug}_prophet.pkl")
     print(f"[{datetime.now(timezone.utc).isoformat().replace('+00:00','Z')}] Treinando '{label}' ({len(df)} pontos)...")
+
     m = Prophet(**PROPHET_PARAMS)
+    applied = apply_extra_seasonalities(m, EXTRA_SEASONALITIES)
+
     m.fit(df)
     joblib.dump(m, pkl)
     meta = {
@@ -72,7 +102,8 @@ def train_and_save(df, label, meta_extra=None):
         "saved_at": datetime.now(timezone.utc).isoformat().replace("+00:00","Z"),
         "rows_used": int(len(df)),
         "last_ds": df['ds'].max().isoformat() if not df['ds'].isnull().all() else None,
-        "prophet_params": PROPHET_PARAMS
+        "prophet_params": PROPHET_PARAMS,
+        "extra_seasonalities_applied": applied
     }
     if meta_extra:
         meta.update(meta_extra)
@@ -102,19 +133,18 @@ if available_cols:
     if DS_COLUMN not in available_cols:
         raise ValueError(f"Coluna ds configurada ('{DS_COLUMN}') não encontrada nos metadados: {available_cols}")
 
-# decidir colunas a carregar: ds, y, extras (se disponíveis)
+# decidir colunas a carregar
 usecols = [DS_COLUMN, Y_COLUMN]
 extras_to_use = []
 for col in EXTRA_COLUMNS:
     if not available_cols or col in available_cols:
         extras_to_use.append(col)
 usecols += extras_to_use
-usecols = list(dict.fromkeys(usecols))  # dedup
+usecols = list(dict.fromkeys(usecols))
 
 print(f"[{datetime.now(timezone.utc).isoformat().replace('+00:00','Z')}] Carregando {INPUT_PATH} (colunas={usecols}) ...")
 df = pd.read_csv(INPUT_PATH, compression='gzip', usecols=usecols, parse_dates=[DS_COLUMN])
 df = df.rename(columns={DS_COLUMN: "ds", Y_COLUMN: "y"})
-# manter nomes extras como vierem (ex: EquipmentName)
 df = df.dropna(subset=["ds", "y"])
 df["y"] = pd.to_numeric(df["y"], errors="coerce")
 df = df.dropna(subset=["y"])
@@ -131,7 +161,7 @@ if EQUIPMENT_FILTER:
 if len(df) < 2:
     raise ValueError("Dados insuficientes para treinar (menos de 2 pontos).")
 
-# Opcional: limitar histórico antes do resample (se configurado)
+# limitar histórico opcional
 if TRAIN_MAX_HISTORY_DAYS:
     try:
         days = int(TRAIN_MAX_HISTORY_DAYS)
@@ -142,21 +172,20 @@ if TRAIN_MAX_HISTORY_DAYS:
     except Exception:
         print("Aviso: falha ao aplicar train_max_history_days; ignorando.")
 
-# Treinar modelo geral: sem groupby (usar exatamente os pontos como vieram do select)
+# série geral sem groupby
 general_df = df[["ds", "y"]].sort_values("ds").reset_index(drop=True)
 
-# Se resample habilitado, reamostrar e interpolar
+# resample opcional
 meta_extra = {}
 if TRAIN_RESAMPLE_ENABLED and TRAIN_RESAMPLE_FREQ:
     freq = TRAIN_RESAMPLE_FREQ
-    print(f"[{datetime.now(timezone.utc).isoformat().replace('+00:00','Z')}] Resample ativado: freq={freq}. Preparando série para treino (geral).")
+    print(f"[{datetime.now(timezone.utc).isoformat().replace('+00:00','Z')}] Resample ativado: freq={freq}. Preparando série (geral).")
     before = len(general_df)
-    # reamostar a série geral
     general_rs = general_df.set_index("ds").resample(freq)["y"].mean()
     general_rs = general_rs.interpolate(method="time").ffill().bfill().reset_index()
     general_df = general_rs.rename(columns={0: "y"}).reset_index(drop=True)
     after = len(general_df)
-    print(f"[{datetime.now(timezone.utc).isoformat().replace('+00:00','Z')}] Geral: {before} pontos -> {after} pontos após resample")
+    print(f"[{datetime.now(timezone.utc).isoformat().replace('+00:00','Z')}] Geral: {before} -> {after} pontos após resample")
     meta_extra["resampled"] = True
     meta_extra["resample_freq"] = freq
 else:
@@ -173,7 +202,6 @@ if TRAIN_PER_EQUIPMENT and "EquipmentName" in df.columns:
         if len(sub) < 2:
             print(f" - Pulando '{eq}' (insuficiente: {len(sub)})")
             continue
-        # aplicar resample por equipamento se habilitado
         if TRAIN_RESAMPLE_ENABLED and TRAIN_RESAMPLE_FREQ:
             freq = TRAIN_RESAMPLE_FREQ
             b = len(sub)
@@ -182,7 +210,14 @@ if TRAIN_PER_EQUIPMENT and "EquipmentName" in df.columns:
             sub = sub_rs.reset_index(drop=True)
             print(f" - {eq}: {b} -> {len(sub)} após resample {freq}")
         try:
-            p = train_and_save(sub, eq, meta_extra={"resampled": TRAIN_RESAMPLE_ENABLED, "resample_freq": (TRAIN_RESAMPLE_FREQ if TRAIN_RESAMPLE_ENABLED else None)})
+            p = train_and_save(
+                sub,
+                eq,
+                meta_extra={
+                    "resampled": TRAIN_RESAMPLE_ENABLED,
+                    "resample_freq": (TRAIN_RESAMPLE_FREQ if TRAIN_RESAMPLE_ENABLED else None)
+                }
+            )
             specific_models[eq] = p
         except Exception as e:
             print(f" - Falha ao treinar '{eq}': {e}")

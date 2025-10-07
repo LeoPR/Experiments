@@ -1,14 +1,27 @@
 {
   "prophet": {
     "params": {
-      "changepoint_prior_scale": 1,
+      "changepoint_prior_scale": 0.5,
       "seasonality_mode": "additive",
       "yearly_seasonality": false,
       "weekly_seasonality": true,
-      "daily_seasonality": true,
-      "interval_width": 0.95,
-      "seasonality_prior_scale": 10.0
-    }
+      "daily_seasonality": false,
+      "interval_width": 0.95
+    },
+    "extra_seasonalities": [
+      {
+        "name": "daily_custom",
+        "period": 1,
+        "fourier_order": 15,
+        "prior_scale": 10.0
+      },
+      {
+        "name": "hourly",
+        "period": 0.0416667,
+        "fourier_order": 5,
+        "prior_scale": 5.0
+      }
+    ]
   },
   "models_defaults": {
     "model_dir": "./models",
