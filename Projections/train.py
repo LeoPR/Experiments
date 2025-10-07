@@ -2,11 +2,6 @@
 """
 train.py - Treina modelos Prophet a partir do CSV extraído pelo extrator.
 
-Mudanças (esta versão):
-- Suporte a prophet.extra_seasonalities (config.json) aplicando add_seasonalities antes de fit().
-- Mantida remoção de groupby.
-- Resample opcional permanece.
-- Timestamps timezone-aware (UTC).
 """
 
 import os
