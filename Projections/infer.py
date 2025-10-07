@@ -19,7 +19,7 @@ Uso:
 """
 
 import os, json, math, joblib
-from datetime import datetime
+from datetime import datetime, timezone
 import pandas as pd
 import matplotlib.pyplot as plt
 from pandas.tseries.frequencies import to_offset
@@ -75,13 +75,16 @@ def model_last_ds(meta_path):
     return None
 
 def compute_periods(horizon, resolution):
-    th = pd.Timedelta(horizon)
-    off = to_offset(resolution)
+    # Normalizar strings para evitar FutureWarning
+    horizon_norm = str(horizon).strip().lower()
+    resolution_norm = str(resolution).strip().lower()
+    th = pd.Timedelta(horizon_norm)
+    off = to_offset(resolution_norm)
     return int(math.ceil(th / off))
 
 def infer(equipment_name=None, start=None, horizon="1H", resolution="15min", save_image=True, image_name=None):
     model_path = find_model(equipment_name)
-    print(f"[{datetime.utcnow().isoformat()}Z] Carregando modelo: {model_path}")
+    print(f"[{datetime.now(timezone.utc).isoformat().replace('+00:00','Z')}] Carregando modelo: {model_path}")
     model = joblib.load(model_path)
 
     meta_path = model_path + ".meta.json"
@@ -111,7 +114,11 @@ def infer(equipment_name=None, start=None, horizon="1H", resolution="15min", sav
     else:
         start_ts = last_ds if last_ds is not None else (obs["ds"].max() if not obs.empty else pd.Timestamp.now())
 
-    periods = compute_periods(horizon, resolution)
+    # normalizar antes do cálculo
+    horizon_norm = str(horizon).strip().lower()
+    resolution_norm = str(resolution).strip().lower()
+
+    periods = compute_periods(horizon_norm, resolution_norm)
     if periods <= 0:
         raise ValueError("HORIZON/RESOLUTION resultaram em periods <= 0.")
 
@@ -125,9 +132,9 @@ def infer(equipment_name=None, start=None, horizon="1H", resolution="15min", sav
             print(f"Aviso: predição in-sample falhou: {e}")
 
     # futuro
-    res_off = to_offset(resolution)
+    res_off = to_offset(resolution_norm)
     future_start = pd.to_datetime(start_ts) + res_off
-    future_idx = pd.date_range(start=future_start, periods=periods, freq=resolution)
+    future_idx = pd.date_range(start=future_start, periods=periods, freq=resolution_norm)
     fut_pred = model.predict(pd.DataFrame({"ds": future_idx}))[["ds","yhat","yhat_lower","yhat_upper"]]
 
     if hist_pred is not None:
@@ -140,13 +147,13 @@ def infer(equipment_name=None, start=None, horizon="1H", resolution="15min", sav
     display_end = None
     try:
         display_end = forecast_df["ds"].max()
-        h_td = pd.Timedelta(horizon)
-        if h_td <= pd.Timedelta("1H"):
-            display_start = display_end - pd.Timedelta("24H") + res_off
-        elif h_td <= pd.Timedelta("7D"):
-            display_start = display_end - pd.Timedelta("14D")
-        elif h_td <= pd.Timedelta("30D"):
-            display_start = display_end - pd.Timedelta("90D")
+        h_td = pd.Timedelta(horizon_norm)
+        if h_td <= pd.Timedelta("1h"):
+            display_start = display_end - pd.Timedelta("24h") + res_off
+        elif h_td <= pd.Timedelta("7d"):
+            display_start = display_end - pd.Timedelta("14d")
+        elif h_td <= pd.Timedelta("30d"):
+            display_start = display_end - pd.Timedelta("90d")
     except Exception:
         display_start = None
         display_end = None
@@ -162,7 +169,7 @@ def infer(equipment_name=None, start=None, horizon="1H", resolution="15min", sav
     fname = f"{slugify(equipment_name or 'general')}_forecast_{horizon}_{resolution}.csv.gz"
     out_path = os.path.join(FORECAST_DIR, fname)
     forecast_df.to_csv(out_path, index=False, compression="gzip")
-    print(f"[{datetime.utcnow().isoformat()}Z] Forecast salvo: {out_path}")
+    print(f"[{datetime.now(timezone.utc).isoformat().replace('+00:00','Z')}] Forecast salvo: {out_path}")
 
     # plot (apenas janela filtrada)
     plt.figure(figsize=(11,6))
@@ -189,19 +196,19 @@ def infer(equipment_name=None, start=None, horizon="1H", resolution="15min", sav
                  color='red', linewidth=2, label='Futuro')
 
     # --- ajuste mínimo para rótulos de hora com sufixo "h" ---
-    # Se a janela exibida for curta (até ~24H) ou se a resolução for horária/minutar,
+    # Se a janela exibida for curta (até ~48H) e a resolução for horária/minutar,
     # ajustamos o formatter para mostrar "14h" em vez de "14:00".
     try:
         display_span = None
         if display_start is not None and display_end is not None:
             display_span = display_end - display_start
-        short_window = (display_span is not None and display_span <= pd.Timedelta("2D"))
-        res_lower = resolution.lower()
+        short_window = (display_span is not None and display_span <= pd.Timedelta("2d"))
+        res_lower = resolution_norm
         is_hour_like = ("h" in res_lower and "min" not in res_lower) or ("min" in res_lower) or (res_lower in ("t","min"))
         if short_window and is_hour_like:
             # formatador de horas com 'h'
             ax.xaxis.set_major_formatter(mdates.DateFormatter("%Hh"))
-            # usar locator de horas para ficar legível
+            # usar locator automático para ficar legível
             ax.xaxis.set_major_locator(mdates.AutoDateLocator())
             plt.gcf().autofmt_xdate()
     except Exception:
@@ -220,7 +227,7 @@ def infer(equipment_name=None, start=None, horizon="1H", resolution="15min", sav
         img_name = image_name or f"forecast_{slugify(equipment_name or 'general')}_{horizon}_{resolution}.png"
         img_path = os.path.join(IMAGES_DIR, img_name)
         plt.savefig(img_path)
-        print(f"[{datetime.utcnow().isoformat()}Z] Gráfico salvo: {img_path}")
+        print(f"[{datetime.now(timezone.utc).isoformat().replace('+00:00','Z')}] Gráfico salvo: {img_path}")
 
     plt.show()
     return forecast_df

@@ -21,7 +21,7 @@ import os
 import csv
 import gzip
 import pyodbc
-from datetime import datetime
+from datetime import datetime, timezone
 
 CONFIG_PATH = "config.json"
 
@@ -111,7 +111,8 @@ def run_extract():
     columns_info = []
     sample_python_types = {}
 
-    print(f"[{datetime.utcnow().isoformat()}Z] Iniciando extração. Output: {gzip_path}")
+    ts_now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    print(f"[{ts_now}] Iniciando extração. Output: {gzip_path}")
     print(f"Query (preview):\n{query}")
 
     with pyodbc.connect(conn_str, autocommit=True) as conn:
@@ -122,10 +123,10 @@ def run_extract():
                 cur.execute(query)
             desc = cur.description
             if not desc:
-                with gzip.open(gzip_path, "wt", encoding="utf-8", newline="") as _:
+                with gzip.open(gzip_path, "wt", encoding="utf-8") as _:
                     pass
                 meta = {
-                    "fetched_at": datetime.utcnow().isoformat() + "Z",
+                    "fetched_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
                     "rows_written": 0,
                     "columns": [],
                     "query": query,
@@ -166,7 +167,7 @@ def run_extract():
                         total_written += 1
 
     meta = {
-        "fetched_at": datetime.utcnow().isoformat() + "Z",
+        "fetched_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         "rows_written": total_written,
         "columns": columns_info,
         "sample_python_types": sample_python_types,
@@ -179,7 +180,8 @@ def run_extract():
     with open(meta_path, "w", encoding="utf-8") as fm:
         json.dump(meta, fm, indent=2, ensure_ascii=False)
 
-    print(f"[{datetime.utcnow().isoformat()}Z] Extração concluída. {total_written} linhas -> {gzip_path}")
+    ts_now2 = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    print(f"[{ts_now2}] Extração concluída. {total_written} linhas -> {gzip_path}")
     print(f"Metadados: {meta_path}")
 
 if __name__ == "__main__":

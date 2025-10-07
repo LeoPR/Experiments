@@ -1,12 +1,13 @@
 {
   "prophet": {
     "params": {
-      "changepoint_prior_scale": 0.5,
+      "changepoint_prior_scale": 1,
       "seasonality_mode": "additive",
       "yearly_seasonality": false,
       "weekly_seasonality": true,
       "daily_seasonality": true,
-      "interval_width": 0.80
+      "interval_width": 0.95,
+      "seasonality_prior_scale": 10.0
     }
   },
   "models_defaults": {
@@ -44,7 +45,7 @@
         "equipment_code": "ME02",
         "variable_id": "6df49571-09fd-40bd-8cc3-6ed5564bba36",
         "date_from": {
-          "raw": "DATEADD(day, -30, CAST(GETDATE() AS date))"
+          "raw": "DATEADD(day, -120, CAST(GETDATE() AS date))"
         }
       },
       "param_order": [
@@ -71,7 +72,10 @@
         "EquipmentName"
       ],
       "train_per_equipment": true,
-      "equipment_filter": null
+      "equipment_filter": null,
+      "train_resample_enabled": false,
+      "train_resample_freq": "1min",
+      "train_max_history_days": null
     }
   },
   "infer": {
@@ -83,7 +87,7 @@
     "examples": {
       "hour": {
         "horizon": "1H",
-        "resolution": "15min"
+        "resolution": "1min"
       },
       "week": {
         "horizon": "7D",

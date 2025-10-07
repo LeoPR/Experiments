@@ -33,16 +33,20 @@ if "ds" not in history.columns:
 last_ds = history["ds"].max()
 print(f"Última data do histórico no modelo: {last_ds}")
 
+# Normalizar entradas para evitar FutureWarning (usar minúsculas)
+horizon_norm = str(HORIZON).strip().lower()
+resolution_norm = str(RESOLUTION).strip().lower()
+
 # Calcular número de períodos
-total_horizon = pd.Timedelta(HORIZON)
-freq_offset = to_offset(RESOLUTION)
+total_horizon = pd.Timedelta(horizon_norm)
+freq_offset = to_offset(resolution_norm)
 periods = int(math.ceil(total_horizon / freq_offset))
 if periods <= 0:
     raise ValueError("HORIZON e RESOLUTION resultaram em periods <= 0.")
 
 # Construir datas futuras (inicia após a última observação)
 start_future = last_ds + freq_offset
-future_ds = pd.date_range(start=start_future, periods=periods, freq=RESOLUTION)
+future_ds = pd.date_range(start=start_future, periods=periods, freq=resolution_norm)
 future_df = pd.DataFrame({"ds": future_ds})
 
 print(f"Gerando previsão futura: horizon={HORIZON} (periods={periods}) resolution={RESOLUTION}")

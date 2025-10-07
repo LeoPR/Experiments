@@ -2,25 +2,28 @@
 """
 train.py - Treina modelos Prophet a partir do CSV extraído pelo extrator.
 
-- Lê config.json para localizar o arquivo extraído e parâmetros de treino.
-- Lê o meta do extrator (product_extraction.csv.gz.meta.json) para validar colunas quando disponível.
-- Usa y_column e ds_column do config, e carrega extra_columns (se listadas) para uso como variáveis de agrupamento/metadata.
-- Treina modelo "general" (média por timestamp) e, se configurado e houver EquipmentName, treina por equipamento.
-- Salva modelos em ./models/<slug>_prophet.pkl e metadados .meta.json.
+Mudanças principais:
+- NÃO agrupa mais por 'ds' (o SELECT do banco controla forma/volume).
+- Permite reamostragem (resample) opcional controlada por config (train_resample_enabled, train_resample_freq).
+- train_resample_freq exemplo: "1min". Se ativado, aplica resample+interpolate por série antes do treino.
+- train_max_history_days (opcional) limita janela antes do resample.
 
 Uso:
   pip install pandas prophet joblib
   python train.py
 """
 
-import os, json
-from datetime import datetime
+import os
+import json
+from datetime import datetime, timezone
 import joblib
 import pandas as pd
 from prophet import Prophet
 
+CONFIG_PATH = "config.json"
+
 # carregar config
-with open("config.json", "r", encoding="utf-8") as f:
+with open(CONFIG_PATH, "r", encoding="utf-8") as f:
     cfg = json.load(f)
 
 ext = cfg.get("extractor", {})
@@ -37,6 +40,10 @@ EXTRA_COLUMNS = train_cfg.get("extra_columns", []) or []
 TRAIN_PER_EQUIPMENT = bool(train_cfg.get("train_per_equipment", True))
 EQUIPMENT_FILTER = train_cfg.get("equipment_filter")
 
+TRAIN_RESAMPLE_ENABLED = bool(train_cfg.get("train_resample_enabled", False))
+TRAIN_RESAMPLE_FREQ = train_cfg.get("train_resample_freq", "1min")
+TRAIN_MAX_HISTORY_DAYS = train_cfg.get("train_max_history_days", None)
+
 MODELS_DIR = cfg.get("models_defaults", {}).get("model_dir", "./models")
 PROPHET_PARAMS = cfg.get("prophet", {}).get("params", {})
 
@@ -52,20 +59,26 @@ def slugify(s):
             out.append("_")
     return "".join(out) or "model"
 
-def train_and_save(df, label):
+def train_and_save(df, label, meta_extra=None):
     os.makedirs(MODELS_DIR, exist_ok=True)
     slug = slugify(label)
     pkl = os.path.join(MODELS_DIR, f"{slug}_prophet.pkl")
-    print(f"[{datetime.utcnow().isoformat()}Z] Treinando '{label}' ({len(df)} pontos)...")
+    print(f"[{datetime.now(timezone.utc).isoformat().replace('+00:00','Z')}] Treinando '{label}' ({len(df)} pontos)...")
     m = Prophet(**PROPHET_PARAMS)
     m.fit(df)
     joblib.dump(m, pkl)
-    meta = {"model_label": label, "saved_at": datetime.utcnow().isoformat()+"Z",
-            "rows_used": int(len(df)), "last_ds": df['ds'].max().isoformat() if not df['ds'].isnull().all() else None,
-            "prophet_params": PROPHET_PARAMS}
+    meta = {
+        "model_label": label,
+        "saved_at": datetime.now(timezone.utc).isoformat().replace("+00:00","Z"),
+        "rows_used": int(len(df)),
+        "last_ds": df['ds'].max().isoformat() if not df['ds'].isnull().all() else None,
+        "prophet_params": PROPHET_PARAMS
+    }
+    if meta_extra:
+        meta.update(meta_extra)
     with open(pkl + ".meta.json", "w", encoding="utf-8") as fm:
         json.dump(meta, fm, indent=2, ensure_ascii=False)
-    print(f"[{datetime.utcnow().isoformat()}Z] Salvo: {pkl}")
+    print(f"[{datetime.now(timezone.utc).isoformat().replace('+00:00','Z')}] Salvo: {pkl}")
     return pkl
 
 if not os.path.exists(INPUT_PATH):
@@ -76,7 +89,7 @@ if os.path.exists(META_PATH):
     with open(META_PATH, "r", encoding="utf-8") as fm:
         meta = json.load(fm)
 else:
-    print(f"Aviso: metadados não encontrados em {META_PATH}. Continuarei sem validação antecipada.")
+    print(f"Aviso: metadados não encontrados em {META_PATH}. Seguirei sem validação antecipada.")
 
 available_cols = []
 if meta and "columns" in meta:
@@ -98,7 +111,7 @@ for col in EXTRA_COLUMNS:
 usecols += extras_to_use
 usecols = list(dict.fromkeys(usecols))  # dedup
 
-print(f"[{datetime.utcnow().isoformat()}Z] Carregando {INPUT_PATH} (colunas={usecols}) ...")
+print(f"[{datetime.now(timezone.utc).isoformat().replace('+00:00','Z')}] Carregando {INPUT_PATH} (colunas={usecols}) ...")
 df = pd.read_csv(INPUT_PATH, compression='gzip', usecols=usecols, parse_dates=[DS_COLUMN])
 df = df.rename(columns={DS_COLUMN: "ds", Y_COLUMN: "y"})
 # manter nomes extras como vierem (ex: EquipmentName)
@@ -108,7 +121,7 @@ df = df.dropna(subset=["y"])
 df = df.sort_values("ds").reset_index(drop=True)
 
 if EQUIPMENT_FILTER:
-    print(f"Filtro de equipamento ativo: {EQUIPMENT_FILTER}")
+    print(f"Atenção: filtro de equipamento ativo: {EQUIPMENT_FILTER}")
     if "EquipmentName" not in df.columns:
         raise ValueError("Filtro por equipamento solicitado, mas coluna 'EquipmentName' não está presente nos dados.")
     df = df[df["EquipmentName"] == EQUIPMENT_FILTER]
@@ -118,9 +131,38 @@ if EQUIPMENT_FILTER:
 if len(df) < 2:
     raise ValueError("Dados insuficientes para treinar (menos de 2 pontos).")
 
-# Treinar geral: média por timestamp
-general = df.groupby("ds")["y"].mean().reset_index().sort_values("ds").reset_index(drop=True)
-general_path = train_and_save(general, "general")
+# Opcional: limitar histórico antes do resample (se configurado)
+if TRAIN_MAX_HISTORY_DAYS:
+    try:
+        days = int(TRAIN_MAX_HISTORY_DAYS)
+        cutoff = df["ds"].max() - pd.Timedelta(days=days)
+        before = len(df)
+        df = df[df["ds"] >= cutoff].copy()
+        print(f"[{datetime.now(timezone.utc).isoformat().replace('+00:00','Z')}] Limitei histórico para últimos {days} dias: {before} -> {len(df)} pontos")
+    except Exception:
+        print("Aviso: falha ao aplicar train_max_history_days; ignorando.")
+
+# Treinar modelo geral: sem groupby (usar exatamente os pontos como vieram do select)
+general_df = df[["ds", "y"]].sort_values("ds").reset_index(drop=True)
+
+# Se resample habilitado, reamostrar e interpolar
+meta_extra = {}
+if TRAIN_RESAMPLE_ENABLED and TRAIN_RESAMPLE_FREQ:
+    freq = TRAIN_RESAMPLE_FREQ
+    print(f"[{datetime.now(timezone.utc).isoformat().replace('+00:00','Z')}] Resample ativado: freq={freq}. Preparando série para treino (geral).")
+    before = len(general_df)
+    # reamostar a série geral
+    general_rs = general_df.set_index("ds").resample(freq)["y"].mean()
+    general_rs = general_rs.interpolate(method="time").ffill().bfill().reset_index()
+    general_df = general_rs.rename(columns={0: "y"}).reset_index(drop=True)
+    after = len(general_df)
+    print(f"[{datetime.now(timezone.utc).isoformat().replace('+00:00','Z')}] Geral: {before} pontos -> {after} pontos após resample")
+    meta_extra["resampled"] = True
+    meta_extra["resample_freq"] = freq
+else:
+    meta_extra["resampled"] = False
+
+general_path = train_and_save(general_df, "general", meta_extra=meta_extra)
 
 specific_models = {}
 if TRAIN_PER_EQUIPMENT and "EquipmentName" in df.columns:
@@ -131,8 +173,19 @@ if TRAIN_PER_EQUIPMENT and "EquipmentName" in df.columns:
         if len(sub) < 2:
             print(f" - Pulando '{eq}' (insuficiente: {len(sub)})")
             continue
-        p = train_and_save(sub, eq)
-        specific_models[eq] = p
+        # aplicar resample por equipamento se habilitado
+        if TRAIN_RESAMPLE_ENABLED and TRAIN_RESAMPLE_FREQ:
+            freq = TRAIN_RESAMPLE_FREQ
+            b = len(sub)
+            sub_rs = sub.set_index("ds").resample(freq)["y"].mean()
+            sub_rs = sub_rs.interpolate(method="time").ffill().bfill().reset_index()
+            sub = sub_rs.reset_index(drop=True)
+            print(f" - {eq}: {b} -> {len(sub)} após resample {freq}")
+        try:
+            p = train_and_save(sub, eq, meta_extra={"resampled": TRAIN_RESAMPLE_ENABLED, "resample_freq": (TRAIN_RESAMPLE_FREQ if TRAIN_RESAMPLE_ENABLED else None)})
+            specific_models[eq] = p
+        except Exception as e:
+            print(f" - Falha ao treinar '{eq}': {e}")
 
 print("Treino finalizado.")
 print("Modelo geral:", general_path)
