@@ -148,7 +148,10 @@ if __name__ == "__main__":
     examples = infer_cfg.get("examples", {})
 
     # Exemplo: defina aqui o equipamento para os exemplos (edite conforme necessário)
-    EXAMPLE_EQUIPMENT = "Medidor de Energia P9-QDFI"
+    EXAMPLE_EQUIPMENT = "Medidor de Energia P9-QDFE-2"
+    # Medidor de Energia P9-QGBT
+    # Medidor de Energia P9-QDFI
+    # Medidor de Energia P9-QDFE-2
 
     try:
         e1 = examples.get("hour", {"horizon": "1H", "resolution": "15min"})

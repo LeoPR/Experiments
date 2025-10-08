@@ -32,7 +32,7 @@
     "connection": {
       "server": "10.60.101.232",
       "database": "zilia_navitas",
-      "driver": "ODBC Driver 18 for SQL Server",
+      "driver": "SQL Server",
       "port": 1433,
       "credentials_file": "credenciais.json",
       "env_user_var": "EXTRACTOR_DB_USER",

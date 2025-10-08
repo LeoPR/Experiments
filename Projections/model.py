@@ -7,14 +7,15 @@ Responsabilidades:
 - Carregar config.json
 - Funções utilitárias (slugify, find_model, etc.)
 - Carregar dados observados do CSV
-- Auto-detectar equipamento (quando equipment_name == None e existir só 1 EquipmentName)
+- Auto-detectar equipamento (quando equipment_name == None e existir só 1 Entity)
 - Carregar modelo (específico ou geral)
 - Gerar previsões (histórico + futuro) e aplicar corte de janela de exibição
 
-API pública principal:
-- load_model(equipment_name=None) -> (model, model_path, last_ds)
-- project(model, start_ts, horizon, resolution, obs_df=None) -> (forecast_df, obs_df_filtered, meta)
-- generate_forecast(equipment_name=None, start=None, horizon="1H", resolution="15min")
+Alterações mínimas realizadas:
+- adicionada configuração extractor.train.identity_columns (padrão: ["EquipmentName"])
+- _load_observations agora usa identity_columns para detectar uma identidade única (identity_map)
+- adicionadas funções utilitárias: list_identity_columns(), detect_identity(), list_entities()
+- mantida compatibilidade: _load_observations continua retornando (obs_df, equipment_eff)
 """
 
 import os
@@ -41,6 +42,9 @@ INFER_CFG = CFG.get("infer", {})
 FORECAST_DIR = INFER_CFG.get("forecast_output_dir", "./dados/forecasts")
 GENERAL_MODEL_NAME = INFER_CFG.get("default_models", {}).get("general_name", "general_prophet.pkl")
 SPECIFIC_TEMPLATE = INFER_CFG.get("default_models", {}).get("specific_template", "{slug}_prophet.pkl")
+
+# Novidade: colunas que representam a identidade (equipamento / grupo / etc.)
+IDENTITY_COLUMNS = CFG.get("extractor", {}).get("train", {}).get("identity_columns", ["EquipmentName"])
 
 def utcnow_z():
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
@@ -96,12 +100,50 @@ def compute_periods(horizon, resolution):
     periods = int(math.ceil(th / off))
     return periods, horizon_norm, resolution_norm, off
 
+def detect_identity(obs_df):
+    """
+    Inspeciona obs_df e tenta detectar uma identidade única com base em IDENTITY_COLUMNS.
+    Retorna um dict {col: value} se houver exatamente uma combinação distinta não-nula,
+    caso contrário retorna None.
+    """
+    if obs_df is None or obs_df.empty:
+        return None
+    cols = [c for c in IDENTITY_COLUMNS if c in obs_df.columns]
+    if not cols:
+        return None
+    # eliminar linhas com NaN nas colunas de identidade e obter combinações únicas
+    uniq = obs_df.dropna(subset=cols)[cols].drop_duplicates()
+    if len(uniq) == 1:
+        row = uniq.iloc[0]
+        return {col: row[col] for col in cols}
+    return None
+
+def list_identity_columns():
+    """
+    Retorna as colunas configuradas como identity (ex: ['EquipmentName']).
+    """
+    return list(IDENTITY_COLUMNS)
+
+def list_entities(column):
+    """
+    Lista valores distintos da coluna pedida no arquivo de entrada (INPUT_PATH).
+    Retorna lista vazia se o arquivo não existir ou a coluna não estiver presente.
+    """
+    if not os.path.exists(INPUT_PATH):
+        return []
+    try:
+        df = pd.read_csv(INPUT_PATH, compression="gzip", usecols=[column])
+    except Exception:
+        return []
+    vals = df[column].dropna().unique().tolist()
+    return vals
+
 def _load_observations(equipment_name):
     """
     Carrega o CSV de dados observados e:
       - renomeia colunas ds/y
       - preserva colunas extras definidas em config.extractor.train.extra_columns
-      - auto-detecta equipment_name se não foi passado e houver exatamente um (coluna 'EquipmentName')
+      - auto-detecta equipamento/identidade se não foi passado e houver exatamente uma combinação
     Retorna: (obs_df, equipment_name_effective)
     """
     obs = pd.DataFrame(columns=["ds", "y"])
@@ -133,12 +175,15 @@ def _load_observations(equipment_name):
     if "ds" in raw.columns and "y" in raw.columns:
         obs = raw[use_cols].dropna(subset=["ds", "y"]).sort_values("ds").reset_index(drop=True)
 
-        # auto-detect
-        if equipment_eff is None and "EquipmentName" in obs.columns:
-            uniq = obs["EquipmentName"].dropna().unique()
-            if len(uniq) == 1:
-                equipment_eff = uniq[0]
-                print(f"[{utcnow_z()}] EquipmentName detectado: '{equipment_eff}' -> tentando modelo específico.")
+        # tentativa genérica de auto-detect usando identity columns
+        identity_map = detect_identity(obs)
+        if identity_map is not None:
+            # se não foi passado equipment_name explicitamente, e existir EquipmentName na identity_map,
+            # definimos equipment_eff para manter compatibilidade com código antigo.
+            if equipment_eff is None and "EquipmentName" in identity_map:
+                equipment_eff = identity_map.get("EquipmentName")
+            print(f"[{utcnow_z()}] Identidade detectada: {identity_map} -> tentando modelo específico.")
+
     return obs, equipment_eff
 
 # ----------------- Novas funções expostas (Passo 1) -----------------

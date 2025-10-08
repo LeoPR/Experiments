@@ -138,7 +138,7 @@ def run_extract():
 
     os.makedirs(output_dir, exist_ok=True)
 
-    conn_str = f"DRIVER={{{driver}}};SERVER={server},{port};DATABASE={database};UID={username};PWD={password}"
+    conn_str = f"DRIVER={{{driver}}};SERVER={server},{port};DATABASE={database};UID={username};PWD={password};TrustServerCertificate=yes"
 
     total_written = 0
     columns_info = []
