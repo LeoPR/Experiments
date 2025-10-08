@@ -12,6 +12,7 @@ infer.py - Inferência minimalista usando modelos Prophet treinados.
     * <=30D -> últimos 3 meses (~90D)
 
 Alteração solicitada: exibir rótulos de hora com sufixo "h" (ex: "14h") quando a janela for curta / quando for sensible mostrar horas.
+Além disso: se equipment_name for None, tenta detectar EquipmentName único no CSV (conforme extra_columns em config) e usar o modelo específico.
 
 Uso:
   pip install pandas prophet joblib matplotlib
@@ -83,14 +84,11 @@ def compute_periods(horizon, resolution):
     return int(math.ceil(th / off))
 
 def infer(equipment_name=None, start=None, horizon="1H", resolution="15min", save_image=True, image_name=None):
-    model_path = find_model(equipment_name)
-    print(f"[{datetime.now(timezone.utc).isoformat().replace('+00:00','Z')}] Carregando modelo: {model_path}")
-    model = joblib.load(model_path)
-
-    meta_path = model_path + ".meta.json"
-    last_ds = model_last_ds(meta_path)
-
-    # carregar observados
+    """
+    Se equipment_name for None, tenta detectar EquipmentName único no CSV (conforme config.extractor.train.extra_columns).
+    Depois carrega o modelo (específico se existir, senão general) e segue com a previsão.
+    """
+    # carregar observados (mantendo extras configuradas)
     obs = pd.DataFrame(columns=["ds","y"])
     if os.path.exists(INPUT_PATH):
         raw = pd.read_csv(
@@ -106,9 +104,34 @@ def infer(equipment_name=None, start=None, horizon="1H", resolution="15min", sav
             if lc in ("value","valor","val"):
                 colmap[c] = "y"
         raw = raw.rename(columns=colmap)
-        if "ds" in raw.columns and "y" in raw.columns:
-            obs = raw[["ds","y"]].dropna().sort_values("ds").reset_index(drop=True)
 
+        # incluir colunas extras configuradas (ex: EquipmentName) se existirem no CSV
+        train_extra_cols = cfg.get("extractor", {}).get("train", {}).get("extra_columns", []) or []
+        available_extra = [c for c in train_extra_cols if c in raw.columns]
+
+        # preparar lista de colunas para obs: ds, y + extras presentes
+        use_cols = ["ds", "y"] + available_extra
+        use_cols = [c for c in use_cols if c in raw.columns]
+
+        if "ds" in raw.columns and "y" in raw.columns:
+            obs = raw[use_cols].dropna(subset=["ds", "y"]).sort_values("ds").reset_index(drop=True)
+
+            # Auto-detect equipment_name se não foi passado e houver exatamente 1 equipamento no CSV
+            if equipment_name is None and "EquipmentName" in obs.columns:
+                unique_eq = obs["EquipmentName"].dropna().unique()
+                if len(unique_eq) == 1:
+                    equipment_name = unique_eq[0]
+                    print(f"[{datetime.now(timezone.utc).isoformat().replace('+00:00','Z')}] EquipmentName detectado no CSV: '{equipment_name}' -> usando modelo específico.")
+
+    # Agora que possivelmente ajustamos equipment_name, localizar e carregar o modelo
+    model_path = find_model(equipment_name)
+    print(f"[{datetime.now(timezone.utc).isoformat().replace('+00:00','Z')}] Carregando modelo: {model_path}")
+    model = joblib.load(model_path)
+
+    meta_path = model_path + ".meta.json"
+    last_ds = model_last_ds(meta_path)
+
+    # decidir start_ts (prioridade: start param -> last_ds do modelo -> obs max -> agora)
     if start:
         start_ts = pd.to_datetime(start)
     else:

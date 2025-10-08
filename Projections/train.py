@@ -2,6 +2,10 @@
 """
 train.py - Treina modelos Prophet a partir do CSV extraído pelo extrator.
 
+Alterações mínimas:
+- Usa estritamente as chaves presentes em config.json para ds/y e paths (erro se ausentes).
+- Normaliza TRAIN_RESAMPLE_FREQ e corrige o fluxo de resample para produzir ['ds','y'].
+- Loga as configurações efetivamente utilizadas para facilitar debug.
 """
 
 import os
@@ -19,23 +23,32 @@ with open(CONFIG_PATH, "r", encoding="utf-8") as f:
 
 ext = cfg.get("extractor", {})
 out = ext.get("output", {})
-inp_dir = out.get("output_dir", "./dados")
-basename = out.get("output_basename", "product_extraction")
+inp_dir = out.get("output_dir")
+basename = out.get("output_basename")
+if not inp_dir or not basename:
+    raise ValueError("Config: extractor.output.output_dir e output_basename devem estar definidos no config.json")
+
 INPUT_PATH = os.path.join(inp_dir, basename + ".csv.gz")
 META_PATH = os.path.join(inp_dir, basename + ".csv.gz.meta.json")
 
 train_cfg = ext.get("train", {})
-Y_COLUMN = train_cfg.get("y_column", "Value")
-DS_COLUMN = train_cfg.get("ds_column", "Date")
+Y_COLUMN = train_cfg.get("y_column")
+DS_COLUMN = train_cfg.get("ds_column")
+if not Y_COLUMN or not DS_COLUMN:
+    raise ValueError("Config: extractor.train.y_column e extractor.train.ds_column são obrigatórios no config.json")
+
 EXTRA_COLUMNS = train_cfg.get("extra_columns", []) or []
 TRAIN_PER_EQUIPMENT = bool(train_cfg.get("train_per_equipment", True))
 EQUIPMENT_FILTER = train_cfg.get("equipment_filter")
 
 TRAIN_RESAMPLE_ENABLED = bool(train_cfg.get("train_resample_enabled", False))
-TRAIN_RESAMPLE_FREQ = train_cfg.get("train_resample_freq", "1min")
+TRAIN_RESAMPLE_FREQ = train_cfg.get("train_resample_freq", None)
 TRAIN_MAX_HISTORY_DAYS = train_cfg.get("train_max_history_days", None)
 
-MODELS_DIR = cfg.get("models_defaults", {}).get("model_dir", "./models")
+MODELS_DIR = cfg.get("models_defaults", {}).get("model_dir")
+if not MODELS_DIR:
+    raise ValueError("Config: models_defaults.model_dir deve estar definido no config.json")
+
 PROPHET_PARAMS = cfg.get("prophet", {}).get("params", {})
 EXTRA_SEASONALITIES = cfg.get("prophet", {}).get("extra_seasonalities", [])
 
@@ -72,7 +85,6 @@ def apply_extra_seasonalities(model, extra_list):
                 "fourier_order": seas["fourier_order"],
                 "prior_scale": seas.get("prior_scale", 10.0)
             }
-            # mode é opcional; só passar se presente
             if "mode" in seas and seas["mode"]:
                 kwargs["mode"] = seas["mode"]
             model.add_seasonality(**kwargs)
@@ -107,6 +119,17 @@ def train_and_save(df, label, meta_extra=None):
     print(f"[{datetime.now(timezone.utc).isoformat().replace('+00:00','Z')}] Salvo: {pkl}")
     return pkl
 
+# Log das configurações efetivas (ajuda a confirmar que estamos usando o config.json)
+print(f"[{datetime.now(timezone.utc).isoformat().replace('+00:00','Z')}] CONFIG USADA:")
+print(f"  INPUT_PATH = {INPUT_PATH}")
+print(f"  MODELS_DIR = {MODELS_DIR}")
+print(f"  DS_COLUMN = '{DS_COLUMN}', Y_COLUMN = '{Y_COLUMN}'")
+print(f"  EXTRA_COLUMNS = {EXTRA_COLUMNS}")
+print(f"  TRAIN_PER_EQUIPMENT = {TRAIN_PER_EQUIPMENT}")
+print(f"  TRAIN_RESAMPLE_ENABLED = {TRAIN_RESAMPLE_ENABLED}, TRAIN_RESAMPLE_FREQ = {TRAIN_RESAMPLE_FREQ}")
+if TRAIN_MAX_HISTORY_DAYS:
+    print(f"  TRAIN_MAX_HISTORY_DAYS = {TRAIN_MAX_HISTORY_DAYS}")
+
 if not os.path.exists(INPUT_PATH):
     raise FileNotFoundError(f"Arquivo de entrada não encontrado: {INPUT_PATH}")
 
@@ -121,14 +144,14 @@ available_cols = []
 if meta and "columns" in meta:
     available_cols = [c.get("name") for c in meta.get("columns", []) if c.get("name")]
 
-# validações mínimas
+# validações mínimas usando estritamente o config.json
 if available_cols:
     if Y_COLUMN not in available_cols:
         raise ValueError(f"Coluna y configurada ('{Y_COLUMN}') não encontrada nos metadados: {available_cols}")
     if DS_COLUMN not in available_cols:
         raise ValueError(f"Coluna ds configurada ('{DS_COLUMN}') não encontrada nos metadados: {available_cols}")
 
-# decidir colunas a carregar
+# decidir colunas a carregar (usa os valores do config)
 usecols = [DS_COLUMN, Y_COLUMN]
 extras_to_use = []
 for col in EXTRA_COLUMNS:
@@ -140,6 +163,7 @@ usecols = list(dict.fromkeys(usecols))
 print(f"[{datetime.now(timezone.utc).isoformat().replace('+00:00','Z')}] Carregando {INPUT_PATH} (colunas={usecols}) ...")
 df = pd.read_csv(INPUT_PATH, compression='gzip', usecols=usecols, parse_dates=[DS_COLUMN])
 df = df.rename(columns={DS_COLUMN: "ds", Y_COLUMN: "y"})
+# manter nomes extras como vierem (ex: EquipmentName)
 df = df.dropna(subset=["ds", "y"])
 df["y"] = pd.to_numeric(df["y"], errors="coerce")
 df = df.dropna(subset=["y"])
@@ -170,15 +194,16 @@ if TRAIN_MAX_HISTORY_DAYS:
 # série geral sem groupby
 general_df = df[["ds", "y"]].sort_values("ds").reset_index(drop=True)
 
-# resample opcional
+# resample opcional (corrigido para produzir DataFrame com colunas ['ds','y'])
 meta_extra = {}
 if TRAIN_RESAMPLE_ENABLED and TRAIN_RESAMPLE_FREQ:
-    freq = TRAIN_RESAMPLE_FREQ
+    freq = str(TRAIN_RESAMPLE_FREQ).strip().lower()
     print(f"[{datetime.now(timezone.utc).isoformat().replace('+00:00','Z')}] Resample ativado: freq={freq}. Preparando série (geral).")
     before = len(general_df)
+    # reamostrar a série geral -> Series com name 'y', depois reset_index() -> DataFrame ['ds','y']
     general_rs = general_df.set_index("ds").resample(freq)["y"].mean()
     general_rs = general_rs.interpolate(method="time").ffill().bfill().reset_index()
-    general_df = general_rs.rename(columns={0: "y"}).reset_index(drop=True)
+    general_df = general_rs.rename(columns={general_rs.columns[0]: "ds", general_rs.columns[1]: "y"}) if len(general_rs.columns) >= 2 else general_rs.reset_index()
     after = len(general_df)
     print(f"[{datetime.now(timezone.utc).isoformat().replace('+00:00','Z')}] Geral: {before} -> {after} pontos após resample")
     meta_extra["resampled"] = True
@@ -198,11 +223,12 @@ if TRAIN_PER_EQUIPMENT and "EquipmentName" in df.columns:
             print(f" - Pulando '{eq}' (insuficiente: {len(sub)})")
             continue
         if TRAIN_RESAMPLE_ENABLED and TRAIN_RESAMPLE_FREQ:
-            freq = TRAIN_RESAMPLE_FREQ
+            freq = str(TRAIN_RESAMPLE_FREQ).strip().lower()
             b = len(sub)
             sub_rs = sub.set_index("ds").resample(freq)["y"].mean()
             sub_rs = sub_rs.interpolate(method="time").ffill().bfill().reset_index()
-            sub = sub_rs.reset_index(drop=True)
+            # garantir colunas ['ds','y']
+            sub = sub_rs.rename(columns={sub_rs.columns[0]: "ds", sub_rs.columns[1]: "y"}) if len(sub_rs.columns) >= 2 else sub_rs.reset_index()
             print(f" - {eq}: {b} -> {len(sub)} após resample {freq}")
         try:
             p = train_and_save(
