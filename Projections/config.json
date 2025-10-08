@@ -49,20 +49,20 @@
         "JOIN VariableEquipment ve ON ve.EquipmentId = e.Id AND ve.IsEnabled = 1",
         "JOIN Variable v ON v.Id = ve.VariableId",
         "JOIN VariableValue vv ON vv.VariableEquipmentId = ve.Id",
-        "WHERE 1=1 ",
+        "WHERE 1=1 -- e.Code = {equipment_code}",
         "  AND v.Id = {variable_id}",
         "  AND vv.[Date] >= {date_from}",
         "ORDER BY 4 DESC"
       ],
       "params": {
-        
+        "equipment_code": "ME02",
         "variable_id": "6df49571-09fd-40bd-8cc3-6ed5564bba36",
         "date_from": {
           "raw": "DATEADD(day, -120, CAST(GETDATE() AS date))"
         }
       },
       "param_order": [
-        
+        "equipment_code",
         "variable_id",
         "date_from"
       ]

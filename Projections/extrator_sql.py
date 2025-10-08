@@ -1,20 +1,21 @@
 #!/usr/bin/env python3
 """
-extrator_sql.py - Extrator simplificado e seguro.
+extrator_sql.py - Extrator simplificado com detecção de parâmetros robusta.
+
+Alteração principal (aprovada):
+- param_values_from_config agora recebe também a query_template e:
+  * ignora placeholders que aparecem apenas em comentários de linha ("-- ...")
+  * usa extractor.query.param_order se presente, senão usa a ordem das chaves em extractor.query.params
+  * só coloca "?" (e adiciona bind value) para parâmetros efetivamente presentes na SQL ativa
+  * injeta fragments "raw" inline quando configurado
 
 Comportamento:
-- Lê config.json para obter connection, query e output.
-- Constrói query a partir de template_lines e params (suporta params raw vs bind).
-- Executa a query via pyodbc (com bind quando aplicável).
-- Grava resultado em CSV.gz (mantém as colunas retornadas pelo DB).
-- Gera meta JSON ao lado (fetched_at, rows_written, columns, sample_python_types, query, params).
+- Monta a query a partir de template_lines e params (suporta params raw vs bind).
+- Executa via pyodbc (bind apenas para os parâmetros ativos).
+- Grava CSV.gz com as colunas retornadas pelo SELECT (não faz pós-filtragem).
+- Gera meta JSON com informações básicas.
 
-Mudanças principais em relação à versão anterior:
-- Código mais compacto e linear (mesmas funcionalidades).
-- Funções auxiliares pequenas e óbvias: load_json, param_values_from_config, resolve_credentials, format_value_for_csv.
-- Não faz pós-filtragem de colunas: escreve exatamente o que o SELECT retornar (se quiser outras colunas, modifique a SQL no config).
-- Mantive comportamento de "raw" vs binding para parâmetros do query.
-- Mantive escrita em streaming com fetchmany(batch_size).
+Mudanças intencionais: mínima alteração no fluxo original — substituí apenas a forma como os placeholders e bind values são determinados, para evitar o erro ao comentar parâmetros na SQL.
 
 Uso:
   pip install pyodbc
@@ -34,18 +35,40 @@ def load_json(path):
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
 
-def param_values_from_config(qcfg):
+def param_values_from_config(qcfg, query_template):
     """
-    Retorna (fmt_map, bind_values_tuple)
-    - fmt_map: mapping para format() na query template (raw fragments -> inline, outros -> '?')
-    - bind_values_tuple: tupla na ordem definida por param_order para passar ao cursor.execute
+    Retorna (fmt_map, bind_values_tuple).
+
+    Regras:
+    - order = qcfg.param_order se presente, senão usa a ordem natural de qcfg.params (inserção no JSON).
+    - antes de decidir se um placeholder está ativo, removemos os comentários de linha (parte após "--")
+      e só então procuramos por ocorrências de {name}.
+    - se placeholder não aparece na query (sem comentários) então substituímos por "" e NÃO adicionamos bind.
+    - se o valor é {"raw": "..."} então substituímos inline pelo fragmento raw (sem bind).
+    - caso contrário substituímos por "?" e adicionamos o valor à lista de bind_values na ordem.
     """
-    order = qcfg.get("param_order", [])
     params = qcfg.get("params", {}) or {}
+    # determinar ordem: param_order explicito ou ordem das chaves de params
+    order = qcfg.get("param_order")
+    if order is None:
+        # preserva a ordem de inserção do dict (Python 3.7+ mantém ordem)
+        order = list(params.keys())
+
+    # criar versão da query sem comentários de linha para detectar placeholders ativos
+    # removemos tudo após '--' em cada linha (simples e suficiente para comentários SQL de linha)
+    template_no_comments = "\n".join(line.split("--", 1)[0] for line in query_template.splitlines())
+
     fmt_map = {}
     bind_values = []
     for name in order:
         val = params.get(name)
+        placeholder = "{" + name + "}"
+        # se placeholder não aparece na SQL ativa, não bindamos nem deixamos '?'
+        if placeholder not in template_no_comments:
+            fmt_map[name] = ""  # remove o placeholder se ainda existir no template
+            continue
+
+        # placeholder está ativo: decidir raw vs bind
         if isinstance(val, dict) and "raw" in val:
             fmt_map[name] = val["raw"]
         else:
@@ -84,7 +107,7 @@ def resolve_credentials(conn_cfg):
 
 def run_extract():
     cfg = load_json(CONFIG_PATH)
-    ext = cfg.get("extractor", {})
+    ext = cfg.get("extractor", {}) or {}
     conn_cfg = ext.get("connection", {}) or {}
     q_cfg = ext.get("query", {}) or {}
     out_cfg = ext.get("output", {}) or {}
@@ -108,9 +131,9 @@ def run_extract():
     if not query_lines:
         raise ValueError("Config: extractor.query.template_lines vazio.")
 
-    # montar query e bind values
-    fmt_map, bind_values = param_values_from_config(q_cfg)
+    # juntar template e determinar fmt_map/bind_values com a nova rotina
     query_template = "\n".join(line.rstrip() for line in query_lines)
+    fmt_map, bind_values = param_values_from_config(q_cfg, query_template)
     query = query_template.format(**fmt_map)
 
     os.makedirs(output_dir, exist_ok=True)
