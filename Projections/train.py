@@ -2,10 +2,10 @@
 """
 train.py - Treina modelos Prophet a partir do CSV extraído pelo extrator.
 
-Alterações mínimas:
-- Usa estritamente as chaves presentes em config.json para ds/y e paths (erro se ausentes).
-- Normaliza TRAIN_RESAMPLE_FREQ e corrige o fluxo de resample para produzir ['ds','y'].
-- Loga as configurações efetivamente utilizadas para facilitar debug.
+Refactor mínimo:
+- Helpers: ts_now(), normalize_freq(), resample_series(), load_input_csv()
+- Mantive comportamento, validações e metadados como antes.
+- Objetivo: reduzir duplicação (reamostragem) e centralizar parsing do CSV.
 """
 
 import os
@@ -52,6 +52,13 @@ if not MODELS_DIR:
 PROPHET_PARAMS = cfg.get("prophet", {}).get("params", {})
 EXTRA_SEASONALITIES = cfg.get("prophet", {}).get("extra_seasonalities", [])
 
+# ------------------ HELPERS ------------------
+def ts_now():
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+def normalize_freq(freq):
+    return str(freq).strip().lower() if freq is not None else None
+
 def slugify(s):
     s = str(s or "")
     out = []
@@ -64,17 +71,40 @@ def slugify(s):
             out.append("_")
     return "".join(out) or "model"
 
+def resample_series(df, freq, value_col="y"):
+    """
+    Reamostra DataFrame com índice temporal em 'ds' e coluna de valor.
+    Retorna DataFrame com colunas ['ds','y'] prontas para treino.
+    """
+    if df is None or df.empty:
+        return df
+    freq_norm = normalize_freq(freq)
+    series = df.set_index("ds").resample(freq_norm)[value_col].mean()
+    series = series.interpolate(method="time").ffill().bfill().reset_index()
+    series = series.rename(columns={value_col: "y"})
+    # garantir a ordem das colunas
+    series = series[["ds", "y"]]
+    return series
+
+def load_input_csv(path, usecols, ds_col, y_col):
+    """
+    Carrega CSV.gz com parse de datas, renomeia colunas para 'ds' e 'y',
+    converte y para numérico e remove NaNs.
+    """
+    df = pd.read_csv(path, compression='gzip', usecols=usecols, parse_dates=[ds_col])
+    df = df.rename(columns={ds_col: "ds", y_col: "y"})
+    df = df.dropna(subset=["ds", "y"])
+    df["y"] = pd.to_numeric(df["y"], errors="coerce")
+    df = df.dropna(subset=["y"])
+    df = df.sort_values("ds").reset_index(drop=True)
+    return df
+
+# ------------------ TRAIN UTILITIES ------------------
 def apply_extra_seasonalities(model, extra_list):
     """
     Aplica sazonalidades extras definidas no config.
-    Estrutura esperada de cada item:
-      {
-        "name": "...",
-        "period": <float>,
-        "fourier_order": <int>,
-        "prior_scale": <float opcional>,
-        "mode": <'additive'|'multiplicative' opcional>
-      }
+    Cada item esperado:
+      {"name": "...", "period": <float>, "fourier_order": <int>, "prior_scale": <float opcional>, "mode": <...>}
     """
     applied = []
     for seas in extra_list:
@@ -97,7 +127,7 @@ def train_and_save(df, label, meta_extra=None):
     os.makedirs(MODELS_DIR, exist_ok=True)
     slug = slugify(label)
     pkl = os.path.join(MODELS_DIR, f"{slug}_prophet.pkl")
-    print(f"[{datetime.now(timezone.utc).isoformat().replace('+00:00','Z')}] Treinando '{label}' ({len(df)} pontos)...")
+    print(f"[{ts_now()}] Treinando '{label}' ({len(df)} pontos)...")
 
     m = Prophet(**PROPHET_PARAMS)
     applied = apply_extra_seasonalities(m, EXTRA_SEASONALITIES)
@@ -106,7 +136,7 @@ def train_and_save(df, label, meta_extra=None):
     joblib.dump(m, pkl)
     meta = {
         "model_label": label,
-        "saved_at": datetime.now(timezone.utc).isoformat().replace("+00:00","Z"),
+        "saved_at": ts_now(),
         "rows_used": int(len(df)),
         "last_ds": df['ds'].max().isoformat() if not df['ds'].isnull().all() else None,
         "prophet_params": PROPHET_PARAMS,
@@ -116,11 +146,12 @@ def train_and_save(df, label, meta_extra=None):
         meta.update(meta_extra)
     with open(pkl + ".meta.json", "w", encoding="utf-8") as fm:
         json.dump(meta, fm, indent=2, ensure_ascii=False)
-    print(f"[{datetime.now(timezone.utc).isoformat().replace('+00:00','Z')}] Salvo: {pkl}")
+    print(f"[{ts_now()}] Salvo: {pkl}")
     return pkl
 
-# Log das configurações efetivas (ajuda a confirmar que estamos usando o config.json)
-print(f"[{datetime.now(timezone.utc).isoformat().replace('+00:00','Z')}] CONFIG USADA:")
+# ------------------ MAIN FLOW ------------------
+# Log das configurações efetivas
+print(f"[{ts_now()}] CONFIG USADA:")
 print(f"  INPUT_PATH = {INPUT_PATH}")
 print(f"  MODELS_DIR = {MODELS_DIR}")
 print(f"  DS_COLUMN = '{DS_COLUMN}', Y_COLUMN = '{Y_COLUMN}'")
@@ -160,14 +191,8 @@ for col in EXTRA_COLUMNS:
 usecols += extras_to_use
 usecols = list(dict.fromkeys(usecols))
 
-print(f"[{datetime.now(timezone.utc).isoformat().replace('+00:00','Z')}] Carregando {INPUT_PATH} (colunas={usecols}) ...")
-df = pd.read_csv(INPUT_PATH, compression='gzip', usecols=usecols, parse_dates=[DS_COLUMN])
-df = df.rename(columns={DS_COLUMN: "ds", Y_COLUMN: "y"})
-# manter nomes extras como vierem (ex: EquipmentName)
-df = df.dropna(subset=["ds", "y"])
-df["y"] = pd.to_numeric(df["y"], errors="coerce")
-df = df.dropna(subset=["y"])
-df = df.sort_values("ds").reset_index(drop=True)
+print(f"[{ts_now()}] Carregando {INPUT_PATH} (colunas={usecols}) ...")
+df = load_input_csv(INPUT_PATH, usecols, DS_COLUMN, Y_COLUMN)
 
 if EQUIPMENT_FILTER:
     print(f"Atenção: filtro de equipamento ativo: {EQUIPMENT_FILTER}")
@@ -187,25 +212,22 @@ if TRAIN_MAX_HISTORY_DAYS:
         cutoff = df["ds"].max() - pd.Timedelta(days=days)
         before = len(df)
         df = df[df["ds"] >= cutoff].copy()
-        print(f"[{datetime.now(timezone.utc).isoformat().replace('+00:00','Z')}] Limitei histórico para últimos {days} dias: {before} -> {len(df)} pontos")
+        print(f"[{ts_now()}] Limitei histórico para últimos {days} dias: {before} -> {len(df)} pontos")
     except Exception:
         print("Aviso: falha ao aplicar train_max_history_days; ignorando.")
 
 # série geral sem groupby
 general_df = df[["ds", "y"]].sort_values("ds").reset_index(drop=True)
 
-# resample opcional (corrigido para produzir DataFrame com colunas ['ds','y'])
+# resample opcional (usando helper resample_series)
 meta_extra = {}
 if TRAIN_RESAMPLE_ENABLED and TRAIN_RESAMPLE_FREQ:
-    freq = str(TRAIN_RESAMPLE_FREQ).strip().lower()
-    print(f"[{datetime.now(timezone.utc).isoformat().replace('+00:00','Z')}] Resample ativado: freq={freq}. Preparando série (geral).")
+    freq = normalize_freq(TRAIN_RESAMPLE_FREQ)
+    print(f"[{ts_now()}] Resample ativado: freq={freq}. Preparando série (geral).")
     before = len(general_df)
-    # reamostrar a série geral -> Series com name 'y', depois reset_index() -> DataFrame ['ds','y']
-    general_rs = general_df.set_index("ds").resample(freq)["y"].mean()
-    general_rs = general_rs.interpolate(method="time").ffill().bfill().reset_index()
-    general_df = general_rs.rename(columns={general_rs.columns[0]: "ds", general_rs.columns[1]: "y"}) if len(general_rs.columns) >= 2 else general_rs.reset_index()
+    general_df = resample_series(general_df, freq, value_col="y")
     after = len(general_df)
-    print(f"[{datetime.now(timezone.utc).isoformat().replace('+00:00','Z')}] Geral: {before} -> {after} pontos após resample")
+    print(f"[{ts_now()}] Geral: {before} -> {after} pontos após resample")
     meta_extra["resampled"] = True
     meta_extra["resample_freq"] = freq
 else:
@@ -223,12 +245,9 @@ if TRAIN_PER_EQUIPMENT and "EquipmentName" in df.columns:
             print(f" - Pulando '{eq}' (insuficiente: {len(sub)})")
             continue
         if TRAIN_RESAMPLE_ENABLED and TRAIN_RESAMPLE_FREQ:
-            freq = str(TRAIN_RESAMPLE_FREQ).strip().lower()
+            freq = normalize_freq(TRAIN_RESAMPLE_FREQ)
             b = len(sub)
-            sub_rs = sub.set_index("ds").resample(freq)["y"].mean()
-            sub_rs = sub_rs.interpolate(method="time").ffill().bfill().reset_index()
-            # garantir colunas ['ds','y']
-            sub = sub_rs.rename(columns={sub_rs.columns[0]: "ds", sub_rs.columns[1]: "y"}) if len(sub_rs.columns) >= 2 else sub_rs.reset_index()
+            sub = resample_series(sub, freq, value_col="y")
             print(f" - {eq}: {b} -> {len(sub)} após resample {freq}")
         try:
             p = train_and_save(

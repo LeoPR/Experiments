@@ -120,6 +120,10 @@ def infer(equipment_name=None, start=None, horizon="1H", resolution="15min", sav
     # 1) carregar observados e possivelmente detectar equipamento
     obs, equipment_eff = _load_observations(equipment_name)
 
+    # Filtrar observados para o equipamento específico quando aplicável (mudança mínima)
+    if equipment_eff and "EquipmentName" in obs.columns:
+        obs = obs[obs["EquipmentName"] == equipment_eff].copy()
+
     # 2) carregar modelo
     model_obj, model_path, last_ds = load_model(equipment_eff)
 
@@ -143,20 +147,23 @@ if __name__ == "__main__":
     infer_cfg = CFG.get("infer", {})
     examples = infer_cfg.get("examples", {})
 
+    # Exemplo: defina aqui o equipamento para os exemplos (edite conforme necessário)
+    EXAMPLE_EQUIPMENT = "Medidor de Energia P9-QDFI"
+
     try:
         e1 = examples.get("hour", {"horizon": "1H", "resolution": "15min"})
-        infer(equipment_name=None, start=None, horizon=e1["horizon"], resolution=e1["resolution"], save_image=True)
+        infer(equipment_name=EXAMPLE_EQUIPMENT, start=None, horizon=e1["horizon"], resolution=e1["resolution"], save_image=True)
     except Exception as err:
         print("Erro exemplo 1:", err)
 
     try:
         e2 = examples.get("week", {"horizon": "7D", "resolution": "H"})
-        infer(equipment_name=None, start=None, horizon=e2["horizon"], resolution=e2["resolution"], save_image=True)
+        infer(equipment_name=EXAMPLE_EQUIPMENT, start=None, horizon=e2["horizon"], resolution=e2["resolution"], save_image=True)
     except Exception as err:
         print("Erro exemplo 2:", err)
 
     try:
         e3 = examples.get("month", {"horizon": "30D", "resolution": "D"})
-        infer(equipment_name=None, start=None, horizon=e3["horizon"], resolution=e3["resolution"], save_image=True)
+        infer(equipment_name=EXAMPLE_EQUIPMENT, start=None, horizon=e3["horizon"], resolution=e3["resolution"], save_image=True)
     except Exception as err:
         print("Erro exemplo 3:", err)
