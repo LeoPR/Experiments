@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 model.py
-Miolo de lógica de previsão (antes embutido em infer.py):
+Miolo de lógica de previsão (antes embutido em infer.py).
 
 Responsabilidades:
 - Carregar config.json
@@ -10,19 +10,11 @@ Responsabilidades:
 - Auto-detectar equipamento (quando equipment_name == None e existir só 1 EquipmentName)
 - Carregar modelo (específico ou geral)
 - Gerar previsões (histórico + futuro) e aplicar corte de janela de exibição
-- Retornar objetos para que infer.py cuide de salvar CSV e plotar
 
-Função principal:
-  generate_forecast(equipment_name=None, start=None, horizon="1H", resolution="15min")
-
-Retorno:
-  forecast_df (DataFrame filtrado para janela de exibição)
-  obs_filtered (DataFrame de observados filtrados para a janela)
-  equipment_name_effective (str ou None)
-  meta (dict) -> inclui model_path, periods, horizon_norm, resolution_norm, display_start, display_end, last_ds_model
-
-Observação:
-- Não salva arquivos nem gera gráficos aqui; isso fica em infer.py
+API pública principal:
+- load_model(equipment_name=None) -> (model, model_path, last_ds)
+- project(model, start_ts, horizon, resolution, obs_df=None) -> (forecast_df, obs_df_filtered, meta)
+- generate_forecast(equipment_name=None, start=None, horizon="1H", resolution="15min")
 """
 
 import os
@@ -95,6 +87,7 @@ def model_last_ds(meta_path):
 def compute_periods(horizon, resolution):
     """
     Calcula quantidade de períodos futuros baseado no horizonte e resolução normalizados (lowercase).
+    Retorna: (periods, horizon_norm, resolution_norm, offset)
     """
     horizon_norm = str(horizon).strip().lower()
     resolution_norm = str(resolution).strip().lower()
@@ -109,7 +102,7 @@ def _load_observations(equipment_name):
       - renomeia colunas ds/y
       - preserva colunas extras definidas em config.extractor.train.extra_columns
       - auto-detecta equipment_name se não foi passado e houver exatamente um (coluna 'EquipmentName')
-    Retorna: obs_df, equipment_name_eff
+    Retorna: (obs_df, equipment_name_effective)
     """
     obs = pd.DataFrame(columns=["ds", "y"])
     equipment_eff = equipment_name
@@ -148,51 +141,47 @@ def _load_observations(equipment_name):
                 print(f"[{utcnow_z()}] EquipmentName detectado: '{equipment_eff}' -> tentando modelo específico.")
     return obs, equipment_eff
 
-def generate_forecast(equipment_name=None, start=None, horizon="1H", resolution="15min"):
+# ----------------- Novas funções expostas (Passo 1) -----------------
+def load_model(equipment_name=None):
     """
-    Gera forecast (histórico + futuro), aplicando as mesmas regras de janela de exibição do infer original.
-
-    Parâmetros:
-      equipment_name: (str|None) nome do equipamento; se None tenta auto-detectar.
-      start: data inicial para gerar futuro (string ou datetime). Se None, usa last_ds do modelo ou max ds observado ou agora.
-      horizon: string tipo "1H", "7D"...
-      resolution: frequência de previsão ("15min", "H", "D", etc.)
-
-    Retorno:
-      forecast_df_filtrado, obs_filtrado, equipment_name_efetivo, meta_dict
+    Carrega e retorna (model, model_path, last_ds).
+    Lança FileNotFoundError se nenhum modelo encontrado.
     """
-    # 1) Carregar observados e possivelmente detectar equipamento
-    obs, equipment_eff = _load_observations(equipment_name)
-
-    # 2) Carregar modelo
-    model_path = find_model(equipment_eff)
+    model_path = find_model(equipment_name)
     print(f"[{utcnow_z()}] Carregando modelo: {model_path}")
     model = joblib.load(model_path)
+    last_ds = model_last_ds(model_path + ".meta.json")
+    return model, model_path, last_ds
 
-    # 3) last_ds do meta/modelo
-    meta_path = model_path + ".meta.json"
-    last_ds = model_last_ds(meta_path)
-    if start:
-        start_ts = pd.to_datetime(start)
-    else:
-        # prioridade: last_ds do modelo > max ds observado > agora
-        start_ts = last_ds if last_ds is not None else (obs["ds"].max() if not obs.empty else pd.Timestamp.now())
+def project(model,
+            start_ts,
+            horizon,
+            resolution,
+            obs_df=None):
+    """
+    Gera a projeção (histórico + futuro) a partir de um objeto Prophet já carregado.
+    - model: instância Prophet (treinada)
+    - start_ts: timestamp (ou None) — usado apenas para definir início do futuro
+    - horizon/resolution: como em generate_forecast
+    - obs_df: DataFrame opcional com coluna 'ds' para predição in-sample (pode ser None)
 
-    # 4) Calcular períodos
+    Retorna:
+      forecast_df, obs_df_filtered, meta
+    """
     periods, horizon_norm, resolution_norm, res_off = compute_periods(horizon, resolution)
     if periods <= 0:
         raise ValueError("HORIZON/RESOLUTION resultaram em periods <= 0.")
 
-    # 5) Predição in-sample (histórico) — tenta replicar lógica anterior
+    # histórico (in-sample)
     hist_pred = None
-    if not obs.empty:
+    if obs_df is not None and not obs_df.empty:
         try:
-            hist_pred = model.predict(obs[["ds"]])[["ds", "yhat", "yhat_lower", "yhat_upper"]]
-            hist_pred = hist_pred[hist_pred["ds"].isin(obs["ds"])]
+            hist_pred = model.predict(obs_df[["ds"]])[["ds", "yhat", "yhat_lower", "yhat_upper"]]
+            hist_pred = hist_pred[hist_pred["ds"].isin(obs_df["ds"])]
         except Exception as e:
             print(f"Aviso: predição in-sample falhou: {e}")
 
-    # 6) Futuro
+    # futuro
     future_start = pd.to_datetime(start_ts) + res_off
     future_idx = pd.date_range(start=future_start, periods=periods, freq=resolution_norm)
     fut_pred = model.predict(pd.DataFrame({"ds": future_idx}))[["ds", "yhat", "yhat_lower", "yhat_upper"]]
@@ -202,7 +191,7 @@ def generate_forecast(equipment_name=None, start=None, horizon="1H", resolution=
     else:
         forecast_df = fut_pred.sort_values("ds").reset_index(drop=True)
 
-    # 7) Corte de janela de exibição (mesma regra do infer original)
+    # aplicar regra de janela de exibição (mesma usada antes)
     display_start = None
     display_end = None
     try:
@@ -219,20 +208,56 @@ def generate_forecast(equipment_name=None, start=None, horizon="1H", resolution=
         display_end = None
 
     if display_start is not None:
-        if not obs.empty:
-            obs = obs[obs["ds"] >= display_start].copy()
+        if obs_df is not None and not obs_df.empty:
+            obs_df = obs_df[obs_df["ds"] >= display_start].copy()
         forecast_df = forecast_df[forecast_df["ds"] >= display_start].reset_index(drop=True)
 
     meta = {
-        "model_path": model_path,
-        "equipment_name_effective": equipment_eff,
         "periods": periods,
         "horizon_norm": horizon_norm,
         "resolution_norm": resolution_norm,
         "display_start": display_start,
         "display_end": display_end,
-        "last_ds_model": last_ds.isoformat() if last_ds is not None else None,
-        "start_ts_used": start_ts.isoformat()
     }
+    return forecast_df, obs_df, meta
 
-    return forecast_df, obs, equipment_eff, meta
+# ----------------- Função compatível existente -----------------
+def generate_forecast(equipment_name=None, start=None, horizon="1H", resolution="15min"):
+    """
+    Função compatível que encapsula o fluxo completo:
+      - carrega observados (e auto-detecta equipamento)
+      - carrega modelo
+      - decide start_ts (prioridade: start param -> last_ds do modelo -> max obs -> now)
+      - chama project() e retorna os mesmos valores que o infer antigo esperava
+
+    Retorno:
+      forecast_df, obs_filtered, equipment_name_effective, meta
+    """
+    # 1) Carregar observados e possivelmente detectar equipamento
+    obs, equipment_eff = _load_observations(equipment_name)
+
+    # 2) Carregar modelo
+    model_path = find_model(equipment_eff)
+    print(f"[{utcnow_z()}] Carregando modelo: {model_path}")
+    model = joblib.load(model_path)
+
+    # 3) last_ds do meta/modelo
+    meta_path = model_path + ".meta.json"
+    last_ds = model_last_ds(meta_path)
+    if start:
+        start_ts = pd.to_datetime(start)
+    else:
+        start_ts = last_ds if last_ds is not None else (obs["ds"].max() if not obs.empty else pd.Timestamp.now())
+
+    # 4) delegar para project()
+    forecast_df, obs_filtered, meta = project(model, start_ts, horizon, resolution, obs_df=obs)
+
+    # enriquecer meta com info do modelo
+    meta.update({
+        "model_path": model_path,
+        "equipment_name_effective": equipment_eff,
+        "last_ds_model": last_ds.isoformat() if last_ds is not None else None,
+        "start_ts_used": pd.to_datetime(start_ts).isoformat()
+    })
+
+    return forecast_df, obs_filtered, equipment_eff, meta

@@ -1,23 +1,28 @@
 #!/usr/bin/env python3
 """
-extrator_sql.py - Extrator minimalista que aceita params literais ou fragmentos SQL (raw).
-
-Config esperado:
- - extractor.query.template_lines contém placeholders nomeados: {equipment_code}, {variable_id}, {date_from}
- - extractor.query.params tem valores simples ou {"raw": "<SQL_FRAGMENT>"}
- - extractor.query.param_order define a ordem lógica dos parâmetros (para binding)
+extrator_sql.py - Extrator simplificado e seguro.
 
 Comportamento:
- - Substitui placeholders por "?" para parâmetros que serão bindados, ou pelo fragmento SQL para params raw.
- - Executa cur.execute(query, tuple(bind_values))
- - Grava CSV.gz e um meta JSON ao lado.
+- Lê config.json para obter connection, query e output.
+- Constrói query a partir de template_lines e params (suporta params raw vs bind).
+- Executa a query via pyodbc (com bind quando aplicável).
+- Grava resultado em CSV.gz (mantém as colunas retornadas pelo DB).
+- Gera meta JSON ao lado (fetched_at, rows_written, columns, sample_python_types, query, params).
 
-Requisitos:
+Mudanças principais em relação à versão anterior:
+- Código mais compacto e linear (mesmas funcionalidades).
+- Funções auxiliares pequenas e óbvias: load_json, param_values_from_config, resolve_credentials, format_value_for_csv.
+- Não faz pós-filtragem de colunas: escreve exatamente o que o SELECT retornar (se quiser outras colunas, modifique a SQL no config).
+- Mantive comportamento de "raw" vs binding para parâmetros do query.
+- Mantive escrita em streaming com fetchmany(batch_size).
+
+Uso:
   pip install pyodbc
+  python extrator_sql.py
 """
 
-import json
 import os
+import json
 import csv
 import gzip
 import pyodbc
@@ -30,18 +35,20 @@ def load_json(path):
         return json.load(f)
 
 def param_values_from_config(qcfg):
+    """
+    Retorna (fmt_map, bind_values_tuple)
+    - fmt_map: mapping para format() na query template (raw fragments -> inline, outros -> '?')
+    - bind_values_tuple: tupla na ordem definida por param_order para passar ao cursor.execute
+    """
     order = qcfg.get("param_order", [])
-    params = qcfg.get("params", {})
-    # retorna (mapping_for_format, bind_values_tuple)
+    params = qcfg.get("params", {}) or {}
     fmt_map = {}
     bind_values = []
     for name in order:
         val = params.get(name)
         if isinstance(val, dict) and "raw" in val:
-            # raw SQL fragment: inject inline (no binding)
             fmt_map[name] = val["raw"]
         else:
-            # use binding placeholder and append to bind list
             fmt_map[name] = "?"
             bind_values.append(val)
     return fmt_map, tuple(bind_values)
@@ -49,34 +56,39 @@ def param_values_from_config(qcfg):
 def format_value_for_csv(v):
     if v is None:
         return ""
+    # datetimes -> formato legível (sem timezone)
     if hasattr(v, "strftime"):
         return v.strftime("%Y-%m-%d %H:%M:%S")
     return v
 
 def resolve_credentials(conn_cfg):
+    """
+    Resolve credenciais por variáveis de ambiente ou por arquivo credenciais.json (configured).
+    Lança RuntimeError se não encontrar.
+    """
     env_user_var = conn_cfg.get("env_user_var", "EXTRACTOR_DB_USER")
     env_pass_var = conn_cfg.get("env_pass_var", "EXTRACTOR_DB_PASS")
-    user_env = os.getenv(env_user_var)
-    pass_env = os.getenv(env_pass_var)
-    if user_env and pass_env:
-        return user_env, pass_env
+    u = os.getenv(env_user_var)
+    p = os.getenv(env_pass_var)
+    if u and p:
+        return u, p
     cred_file = conn_cfg.get("credentials_file", "credenciais.json")
     if os.path.exists(cred_file):
         data = load_json(cred_file)
-        creds = data.get("extractor_credentials", {})
-        u = creds.get("username")
-        p = creds.get("password")
-        if u and p:
-            return u, p
+        creds = data.get("extractor_credentials", {}) or {}
+        cu = creds.get("username")
+        cp = creds.get("password")
+        if cu and cp:
+            return cu, cp
     raise RuntimeError("Credenciais não encontradas (variáveis de ambiente ou arquivo).")
 
 def run_extract():
     cfg = load_json(CONFIG_PATH)
     ext = cfg.get("extractor", {})
-    conn_cfg = ext.get("connection", {})
-    q_cfg = ext.get("query", {})
-    out_cfg = ext.get("output", {})
-    t_cfg = ext.get("transfer", {})
+    conn_cfg = ext.get("connection", {}) or {}
+    q_cfg = ext.get("query", {}) or {}
+    out_cfg = ext.get("output", {}) or {}
+    t_cfg = ext.get("transfer", {}) or {}
 
     server = conn_cfg.get("server")
     database = conn_cfg.get("database")
@@ -96,11 +108,9 @@ def run_extract():
     if not query_lines:
         raise ValueError("Config: extractor.query.template_lines vazio.")
 
-    # Monta mapa de formatação e bind_values simples (muito direto)
+    # montar query e bind values
     fmt_map, bind_values = param_values_from_config(q_cfg)
-    # junta as linhas com placeholders nomeados
     query_template = "\n".join(line.rstrip() for line in query_lines)
-    # formata: params raw serão substituídos por seu fragmento SQL; os outros por '?'
     query = query_template.format(**fmt_map)
 
     os.makedirs(output_dir, exist_ok=True)
@@ -111,18 +121,22 @@ def run_extract():
     columns_info = []
     sample_python_types = {}
 
-    ts_now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-    print(f"[{ts_now}] Iniciando extração. Output: {gzip_path}")
-    print(f"Query (preview):\n{query}")
+    now_z = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    print(f"[{now_z}] Iniciando extração. Output: {gzip_path}")
+    print("Query (preview):")
+    print(query)
 
     with pyodbc.connect(conn_str, autocommit=True) as conn:
         with conn.cursor() as cur:
+            # executar com bind se houver
             if bind_values:
                 cur.execute(query, bind_values)
             else:
                 cur.execute(query)
+
             desc = cur.description
             if not desc:
+                # sem colunas -> gerar arquivo vazio e meta
                 with gzip.open(gzip_path, "wt", encoding="utf-8") as _:
                     pass
                 meta = {
@@ -134,9 +148,10 @@ def run_extract():
                 }
                 with open(meta_path, "w", encoding="utf-8") as fm:
                     json.dump(meta, fm, indent=2, ensure_ascii=False)
-                print("Extração finalizada: 0 linhas.")
+                print(f"[{datetime.now(timezone.utc).isoformat().replace('+00:00','Z')}] Extração finalizada: 0 linhas.")
                 return
 
+            # cabeçalho a partir do cursor.description (mantém ordem do SELECT)
             col_names = [c[0] for c in desc]
             for c in desc:
                 columns_info.append({
@@ -149,6 +164,7 @@ def run_extract():
                     "null_ok": c[6]
                 })
 
+            # escrita em streaming
             with gzip.open(gzip_path, "wt", encoding="utf-8", newline="") as gz:
                 writer = csv.writer(gz)
                 writer.writerow(col_names)
@@ -160,6 +176,7 @@ def run_extract():
                     for r in rows:
                         row_out = []
                         for idx, val in enumerate(r):
+                            # registrar tipo de amostra para meta (primeira ocorrência)
                             if col_names[idx] not in sample_python_types and val is not None:
                                 sample_python_types[col_names[idx]] = type(val).__name__
                             row_out.append(format_value_for_csv(val))
@@ -180,8 +197,7 @@ def run_extract():
     with open(meta_path, "w", encoding="utf-8") as fm:
         json.dump(meta, fm, indent=2, ensure_ascii=False)
 
-    ts_now2 = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-    print(f"[{ts_now2}] Extração concluída. {total_written} linhas -> {gzip_path}")
+    print(f"[{datetime.now(timezone.utc).isoformat().replace('+00:00','Z')}] Extração concluída. {total_written} linhas -> {gzip_path}")
     print(f"Metadados: {meta_path}")
 
 if __name__ == "__main__":
